@@ -106,6 +106,48 @@ DATA_DIR = Path(getenv("PHANTOM_DATA_DIR", str(REPO_ROOT / "data")))
 RESULTS_DIR = Path(getenv("PHANTOM_RESULTS_DIR", str(REPO_ROOT / "backtest_results")))
 TIMEFRAME_MINUTES: Dict[str, int] = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60}
 
+# MT5 terminal symbol mapping: internal tag -> broker/terminal symbol name.
+# Override from the environment, e.g. PHANTOM_MT5_SYMBOLS="VOL75=Volatility 75 Index,US30=US30"
+def _parse_symbol_map(raw: str) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for pair in raw.split(","):
+        if "=" not in pair:
+            continue
+        internal, _, broker = pair.partition("=")
+        internal, broker = internal.strip(), broker.strip()
+        if internal and broker:
+            mapping[internal] = broker
+    return mapping
+
+
+MT5_SYMBOL_MAP: Dict[str, str] = _parse_symbol_map(
+    getenv("PHANTOM_MT5_SYMBOLS", "")
+) or {
+    "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "USDJPY": "USDJPY", "EURGBP": "EURGBP",
+    "XAUUSD": "XAUUSD", "US30": "US30",
+    "VOL75": "Volatility 75 Index", "VOL100": "Volatility 100 Index",
+    "JUMP100": "Jump 100 Index", "STEP100": "Step Index",
+    "BOOM300": "Boom 300 Index", "CRASH300": "Crash 300 Index",
+}
+
+# Execution bridge: MT5 terminal's MQL5/Files/phantom_bridge directory.
+MT5_FILES_DIR = Path(getenv("PHANTOM_MT5_FILES_DIR", str(REPO_ROOT / "mt5_bridge")))
+MT5_MAGIC = int(getenv("PHANTOM_MT5_MAGIC", "20260115"))
+MT5_TIMEOUT_MS = int(getenv("PHANTOM_MT5_TIMEOUT_MS", "5000"))
+
+
+def broker_symbol(symbol: str) -> str:
+    """Internal symbol tag -> MT5 terminal symbol name."""
+    return MT5_SYMBOL_MAP.get(symbol, symbol)
+
+
+def internal_symbol(broker_name: str) -> str:
+    """Terminal symbol name -> internal tag (inverse of broker_symbol)."""
+    for tag, broker in MT5_SYMBOL_MAP.items():
+        if broker == broker_name:
+            return tag
+    return broker_name
+
 # Telegram Configuration (never commit real secrets; set them in .env or the environment)
 TELEGRAM_BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = getenv("TELEGRAM_CHAT_ID", "YOUR_PHANTOM_ALERTS_CHANNEL_ID")

@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 
 class Direction(Enum):
@@ -20,6 +21,12 @@ class Signal:
     take_profit: float
     risk_reward: float
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Correlation id shared with the MT5 bridge so fill receipts map back to the signal.
+    signal_id: str = field(default_factory=lambda: uuid4().hex)
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
     def geometry_valid(self) -> bool:
         """Stop/target must sit on the correct side of entry for the direction."""

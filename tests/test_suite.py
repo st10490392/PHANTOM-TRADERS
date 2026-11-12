@@ -2,6 +2,7 @@
 PHANTOM-TRADERS Unit Test Suite
 Covers Killzones, Risk Math, Correlation Caps, and Formatting
 """
+import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -11,11 +12,14 @@ from typing import Dict, List, Optional
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG, SYNTHETIC_UNIVERSE
+from config.settings import (ACTIVE_SYMBOLS, MT5_MAGIC, PROP_CONFIG, SYNTHETIC_UNIVERSE,
+                             broker_symbol, internal_symbol)
 from core.backtest import BacktestRunner
-from core.data_feed import available_symbols, csv_path, load_candles
+from core.data_feed import CsvBarFeed, available_symbols, csv_path, load_candles
 from core.engine import LiveEngine
 from core.engine_synthetics import SyntheticScanner
+from core.mt5_bridge import ExecutionBridge, Fill, MT5FileBridge, build_execution
+from core.mt5_feed import MT5BarFeed, build_feed
 from core.risk_manager import RiskManager
 from strategies import sessions as sessions_module
 from strategies.base import Direction, Signal
@@ -539,7 +543,8 @@ class TestPhantomSyntheticsEngine(unittest.TestCase):
         def __init__(self, candles: Dict[str, List[Dict]]):
             self.candles_map = candles
 
-        def candles(self, symbol: str, timeframe: Optional[str] = None) -> List[Dict]:
+        def candles(self, symbol: str, timeframe: Optional[str] = None,
+                    count: Optional[int] = None) -> List[Dict]:
             return self.candles_map.get(symbol, [])
 
     def _ramp(self, direction: str = "up") -> List[Dict]:
@@ -706,6 +711,274 @@ class TestPhantomDataPipeline(unittest.TestCase):
             # R multiple must equal PnL / the $15 risk budget, i.e. sizing really is $15/trade.
             self.assertAlmostEqual(record["net_r"], record["net_usd"] / PROP_CONFIG.BASE_RISK_AMOUNT, places=2)
 
+
+class TestPhantomMt5Feed(unittest.TestCase):
+    """MT5 bar payload conversion with no terminal attached."""
+
+    @staticmethod
+    def _rates(count: int = 60, base: float = 100.0, start: int = 1_735_000_000) -> List[Dict]:
+        return [{"time": start + i, "open": base, "high": base + 0.5, "low": base - 0.5,
+                 "close": base + 0.1 * i, "tick_volume": 12} for i in range(count)]
+
+    def test_maps_broker_symbol_and_utc_bars(self):
+        seen: List[tuple] = []
+
+        def fetch(broker, code, offset, count):
+            seen.append((broker, code, offset, count))
+            return self._rates(count=count)
+
+        feed = MT5BarFeed(timeframe="M1", count=30, initialize=False, rates_fetch=fetch)
+        bars = feed.candles("VOL75", "M1", 30)
+
+        self.assertEqual(seen[0][0], "Volatility 75 Index")   # internal tag mapped
+        self.assertEqual(seen[0][2], 0)                       # copy_rates_from_pos offset
+        self.assertEqual(seen[0][3], 30)                      # count forwarded
+        self.assertEqual(len(bars), 30)
+        self.assertEqual(bars[0]["time"].tzinfo, UTC)         # tz-aware UTC, required by sessions
+        self.assertEqual(bars[0]["volume"], 12)              # tick_volume -> volume
+        self.assertEqual(broker_symbol("VOL75"), "Volatility 75 Index")
+        self.assertEqual(internal_symbol("Volatility 75 Index"), "VOL75")
+
+    def test_degrades_on_disconnect_and_dry_run(self):
+        def empty(*_args):
+            return None
+        disconnected = MT5BarFeed(initialize=False, rates_fetch=empty)
+        self.assertEqual(disconnected.candles("EURUSD", "M1"), [])
+
+        def boom(*_args):
+            raise RuntimeError("terminal disconnected")
+        broken = MT5BarFeed(initialize=False, rates_fetch=boom)
+        self.assertEqual(broken.candles("EURUSD", "M1"), [])   # engine loop must not stall
+
+        self.assertEqual(MT5BarFeed(dry_run=True).candles("EURUSD"), [])
+        self.assertEqual(build_feed("mt5", "M5", 200, dry_run=True).candles("EURUSD"), [])
+        self.assertIsInstance(build_feed("csv"), CsvBarFeed)   # CSV dry-run mode intact
+        with self.assertRaises(ValueError):
+            build_feed("zmq")
+
+    def test_feed_feeds_the_session_engine(self):
+        """MT5-shaped payloads flow through the DST clock and produce a sized signal."""
+        base = datetime(2025, 1, 15, 4, 0, tzinfo=UTC)
+        bars = candles_from([1.1000 + 0.0004 * (i % 4) for i in range(20)], base,
+                            step=timedelta(minutes=5), spread=0.0010)
+        bars += [{"time": datetime(2025, 1, 15, 8, 40, tzinfo=UTC), "open": 1.1010,
+                  "high": 1.1012, "low": 1.0950, "close": 1.1000, "volume": 90},
+                 {"time": datetime(2025, 1, 15, 8, 45, tzinfo=UTC), "open": 1.1000,
+                  "high": 1.1045, "low": 1.0997, "close": 1.1040, "volume": 120}]
+        rates = [{"time": int(bar["time"].timestamp()), "open": bar["open"], "high": bar["high"],
+                  "low": bar["low"], "close": bar["close"], "tick_volume": 40} for bar in bars]
+
+        def fetch(_broker, _code, _offset, count):
+            return rates[-count:]
+
+        feed = MT5BarFeed(timeframe="M5", count=40, initialize=False, rates_fetch=fetch)
+        signal = SMCICTKillzone().analyze(feed.candles("EURUSD", "M5", 40), "EURUSD",
+                                         datetime(2025, 1, 15, 8, 45, tzinfo=UTC))
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.metadata["session"], "LDN")
+
+
+class TestPhantomMt5Bridge(unittest.TestCase):
+    """Atomic order serialization and inbound fill handling with no live terminal."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.bridge = MT5FileBridge(Path(self.tmp.name), magic=MT5_MAGIC)
+        self.posts: List[str] = []
+        self.patcher = patch.object(TelegramDispatcher, "_post",
+                                    side_effect=lambda text: self.posts.append(text) or True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _signal(symbol: str = "EURUSD", tag: str = "SMC_FIB") -> Signal:
+        return Signal(symbol=symbol, direction=Direction.BUY, strategy_tag=tag,
+                      entry_price=107.2 if symbol == "VOL75" else 1.10122,
+                      stop_loss=105.9 if symbol == "VOL75" else 1.09734,
+                      take_profit=110.2 if symbol == "VOL75" else 1.10897,
+                      risk_reward=2.0, metadata={"session": "LDN"})
+
+    def _structure_feed(self):
+        base = datetime(2025, 1, 15, 4, 0, tzinfo=UTC)
+        bars = candles_from([1.1000 + 0.0004 * (i % 4) for i in range(20)], base,
+                            step=timedelta(minutes=5), spread=0.0010)
+        bars += [{"time": datetime(2025, 1, 15, 8, 40, tzinfo=UTC), "open": 1.1010,
+                  "high": 1.1012, "low": 1.0950, "close": 1.1000, "volume": 90},
+                 {"time": datetime(2025, 1, 15, 8, 45, tzinfo=UTC), "open": 1.1000,
+                  "high": 1.1045, "low": 1.0997, "close": 1.1040, "volume": 120}]
+
+        class Feed:
+            def __init__(self, bars):
+                self.bars = bars
+
+            def candles(self, symbol, timeframe=None, count=None):
+                return self.bars
+
+        return Feed(bars)
+
+    def test_order_file_is_atomic_and_mapped(self):
+        signal = self._signal("VOL75", "SYNTH_MOM")
+        path = self.bridge.write_order(signal, {"lot_size": 1.0, "risk_usd": 15.0})
+
+        self.assertEqual(path.name, f"{signal.signal_id}.json")
+        self.assertEqual(list(self.bridge.orders_dir.glob("*.tmp")), [])   # temp renamed away
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["symbol"], "Volatility 75 Index")         # broker mapping
+        self.assertEqual(payload["internal_symbol"], "VOL75")
+        self.assertEqual(payload["action"], "BUY")
+        self.assertEqual(payload["strategy"], "SYNTH_MOM")
+        self.assertEqual(payload["magic"], MT5_MAGIC)
+        self.assertEqual(payload["volume"], 1.0)
+        self.assertEqual(payload["sl"], 130)     # 1.30 / 0.01 point
+        self.assertEqual(payload["tp"], 300)     # 3.00 / 0.01 point
+        self.assertEqual(payload["signal_id"], signal.signal_id)
+
+    def test_points_use_per_symbol_point_size(self):
+        gold = Signal(symbol="XAUUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
+                      entry_price=2650.0, stop_loss=2646.4, take_profit=2657.2, risk_reward=2.0)
+        index = Signal(symbol="US30", direction=Direction.SELL, strategy_tag="SMC_FIB",
+                       entry_price=43000.0, stop_loss=43012.0, take_profit=42976.0, risk_reward=2.0)
+        fx = self._signal("EURUSD")
+        self.assertEqual(self.bridge.points(fx.entry_price - fx.stop_loss, "EURUSD"), 388)
+        self.assertEqual(self.bridge.points(gold.entry_price - gold.stop_loss, "XAUUSD"), 360)
+        self.assertEqual(self.bridge.points(index.stop_loss - index.entry_price, "US30"), 12)
+
+    def test_fill_receipts_are_drained_once_and_quarantined(self):
+        signal = self._signal()
+        self.bridge.write_order(signal, {"lot_size": 0.02, "risk_usd": 15.0})
+        self.bridge.write_fill(Fill(signal.signal_id, "TP", "EURUSD", 1.10897, 0.02, 15.0, "closed"))
+        (self.bridge.fills_dir / "junk.json").write_text("{not json", encoding="utf-8")
+
+        with self.patcher:
+            fills = self.bridge.poll_fills()
+        self.assertEqual([fill.event for fill in fills], ["TP"])
+        self.assertEqual(self.bridge.poll_fills(), [])               # consumed exactly once
+        self.assertTrue((self.bridge.fills_dir / "junk.bad").exists())
+        self.assertEqual(list(self.bridge.fills_dir.glob("*.json")), [])
+
+    def test_unknown_events_and_missing_positions_are_skipped(self):
+        signal = self._signal()
+        self.bridge.write_fill(Fill(signal.signal_id, "NOPE", "EURUSD", 1.10, 0.02, 0.0, "junk"))
+        self.assertEqual(self.bridge.poll_fills(), [])              # unknown event dropped
+        execution = ExecutionBridge(self.bridge, TelegramDispatcher())
+        with self.patcher:
+            self.assertEqual(execution.ingest({}), [])             # no matching position
+        self.assertEqual(self.posts, [])                            # no card for a stranger
+
+    def test_build_execution_follows_the_cli_flag(self):
+        self.assertIsNone(build_execution(False, TelegramDispatcher(), Path(self.tmp.name)))
+        self.assertIsInstance(build_execution(True, TelegramDispatcher(), Path(self.tmp.name)),
+                              ExecutionBridge)
+
+    @staticmethod
+    def _mq5_scalar(payload: str, key: str) -> str:
+        """Mirror PhantomExecutioner's JsonScalar(): quote-delimited key, cut at , or }."""
+        token = f'"{key}":'
+        start = payload.find(token)
+        if start < 0:
+            return ""
+        rest = payload[start + len(token):]
+        cuts = [index for index in (rest.find(","), rest.find("}")) if index >= 0]
+        value = rest[:min(cuts)] if cuts else rest
+        return value.replace('"', "").strip()
+
+    def test_order_payload_is_parsable_by_the_ea(self):
+        gold = Signal(symbol="XAUUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
+                      entry_price=2650.0, stop_loss=2646.4, take_profit=2657.2, risk_reward=2.0)
+        path = self.bridge.write_order(gold, {"lot_size": 0.02, "risk_usd": 15.0})
+        payload = path.read_text(encoding="utf-8")     # indented JSON, like the EA reads it
+
+        self.assertEqual(self._mq5_scalar(payload, "signal_id"), gold.signal_id)
+        self.assertEqual(self._mq5_scalar(payload, "symbol"), "XAUUSD")
+        self.assertEqual(self._mq5_scalar(payload, "action"), "BUY")
+        self.assertEqual(self._mq5_scalar(payload, "strategy"), "SMC_FIB")
+        self.assertEqual(self._mq5_scalar(payload, "magic"), str(MT5_MAGIC))
+        self.assertEqual(float(self._mq5_scalar(payload, "volume")), 0.02)
+        # XAUUSD point size is 0.01, so $3.60 of stop risk is 360 points.
+        self.assertEqual(int(self._mq5_scalar(payload, "sl")), 360)
+        self.assertEqual(int(self._mq5_scalar(payload, "tp")), 720)
+        self.assertEqual(self._mq5_scalar(payload, "internal_symbol"), "XAUUSD")
+
+
+    def test_engine_writes_order_then_applies_receipts(self):
+        engine = LiveEngine(self._structure_feed(), timeframe="M5",
+                            execution=ExecutionBridge(self.bridge, TelegramDispatcher()))
+        tick_at = datetime(2025, 1, 15, 8, 45, tzinfo=UTC)
+
+        with self.patcher:
+            first = engine.tick(now=tick_at, symbols=["EURUSD"])
+        self.assertEqual(first["alerts"], 1)
+        orders = list(self.bridge.orders_dir.glob("*.json"))
+        self.assertEqual(len(orders), 1)
+        payload = json.loads(orders[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["symbol"], "EURUSD")
+        self.assertLessEqual(payload["volume"], ACTIVE_SYMBOLS["EURUSD"].max_lot)
+        # Terminal owns SL/TP in bridge mode, so bars must not simulate exits.
+        self.assertEqual(engine.positions["EURUSD"].take_profit, 1.10897)
+
+        self.bridge.write_fill(Fill(payload["signal_id"], "FILLED", "EURUSD",
+                                    payload["entry"], payload["volume"], None, "filled"))
+        self.bridge.write_fill(Fill(payload["signal_id"], "TP", "EURUSD",
+                                    payload["tp"], payload["volume"], 15.0, "closed on terminal"))
+
+        with self.patcher:
+            engine.tick(now=tick_at, symbols=[])            # drain receipts only
+
+        self.assertEqual(engine.execution.by_signal, {})          # receipt consumed
+        self.assertAlmostEqual(engine.equity, 5015.0, places=2)    # terminal PnL, not a guess
+        self.assertIn("PHANTOM LIFECYCLE | `FILLED`", self.posts[1])
+        self.assertIn("PHANTOM LIFECYCLE | `TP`", self.posts[-1])
+        self.assertIn("💰", self.posts[-1])
+        self.assertEqual(list(self.bridge.fills_dir.glob("*.json")), [])
+
+    def test_rejected_receipt_drops_the_position(self):
+        engine = LiveEngine(self._structure_feed(), timeframe="M5",
+                            execution=ExecutionBridge(self.bridge, TelegramDispatcher()))
+        tick_at = datetime(2025, 1, 15, 8, 45, tzinfo=UTC)
+        with self.patcher:
+            engine.tick(now=tick_at, symbols=["EURUSD"])
+        signal_id = engine.positions["EURUSD"].signal.signal_id
+        self.bridge.write_fill(Fill(signal_id, "REJECTED", "EURUSD", None, None, None,
+                                    "guard refused (tradeable/open/DD/daily budget)"))
+
+        with self.patcher:
+            summary = engine.tick(now=tick_at, symbols=[])         # drain receipts only
+
+        self.assertEqual(engine.execution.by_signal, {})           # position dropped
+        self.assertEqual(summary["rejections"].get(
+            "EURUSD: guard refused (tradeable/open/DD/daily budget)", 0), 1)
+        self.assertIn("⛔", self.posts[-1])
+        self.assertAlmostEqual(engine.equity, 5000.0, places=2)      # nothing filled
+
+    def test_scanner_writes_tagged_synthetic_order(self):
+        closes = [100.0] * 40 + [100.0 + 0.3 * i for i in range(1, 21)] + [107.2]
+        bars = candles_from(closes, datetime(2025, 1, 15, 22, 30, tzinfo=UTC) - timedelta(minutes=60),
+                            step=timedelta(minutes=1), spread=0.5)
+
+        class Feed:
+            def __init__(self, bars):
+                self.bars = bars
+
+            def candles(self, symbol, timeframe=None, count=None):
+                return self.bars
+
+        scanner = SyntheticScanner(Feed(bars), timeframe="M1",
+                                   execution=ExecutionBridge(self.bridge, TelegramDispatcher()))
+        with patch.object(TelegramDispatcher, "_post",
+                          side_effect=lambda text: self.posts.append(text) or True):
+            summary = scanner.scan_once(now=datetime(2025, 1, 15, 22, 30, tzinfo=UTC),
+                                        symbols=["VOL75"])
+
+        self.assertEqual(summary["alerts"], 1)
+        orders = list(self.bridge.orders_dir.glob("*.json"))
+        self.assertEqual(len(orders), 1)
+        payload = json.loads(orders[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["symbol"], "Volatility 75 Index")   # broker mapping
+        self.assertEqual(payload["action"], "BUY")
+        self.assertEqual(payload["strategy"], "SYNTH_MOM")
+        self.assertIn(TelegramDispatcher.SYNTHETIC_TAG, self.posts[0])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

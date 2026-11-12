@@ -77,13 +77,15 @@ class CsvBarFeed:
         self.lookback = lookback
         self._cache: Dict[str, List[Dict]] = {}
 
-    def candles(self, symbol: str, timeframe: Optional[str] = None) -> List[Dict]:
+    def candles(self, symbol: str, timeframe: Optional[str] = None,
+                count: Optional[int] = None) -> List[Dict]:
         timeframe = timeframe or self.timeframe
         key = f"{symbol}_{timeframe}"
         if key not in self._cache:
             self._cache[key] = load_candles(symbol, timeframe, self.data_dir)
         bars = self._cache[key]
-        return window_at(bars, len(bars) - 1, self.lookback) if bars else []
+        window = count or self.lookback
+        return window_at(bars, len(bars) - 1, window) if bars else []
 
     def symbols(self) -> List[str]:
         return available_symbols(self.data_dir, self.timeframe)

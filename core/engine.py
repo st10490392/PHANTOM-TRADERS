@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 
 from .backtest import SCAN_WINDOW, Position
 from .data_feed import CsvBarFeed
+from .mt5_bridge import ExecutionBridge, build_execution
+from .mt5_feed import build_feed
 from .risk_manager import RiskManager
 from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
 from strategies import STRATEGY_REGISTRY
@@ -26,7 +28,8 @@ FOREX_STRATEGIES = ("SMC_FIB", "Z_SCORE")   # session engine; synthetics have th
 class LiveEngine:
     def __init__(self, feed, dispatcher: Optional[TelegramDispatcher] = None,
                  timeframe: str = "M5", equity: float = PROP_CONFIG.BASE_EQUITY,
-                 lookback: int = SCAN_WINDOW):
+                 lookback: int = SCAN_WINDOW, bridge: bool = False,
+                 execution: Optional[ExecutionBridge] = None):
         self.feed = feed
         self.dispatch = dispatcher if dispatcher is not None else TelegramDispatcher()
         self.timeframe = timeframe
@@ -39,6 +42,7 @@ class LiveEngine:
         self.alerts = 0
         self.rejections: Counter = Counter()
         self.max_daily_dd_pct = 0.0
+        self.execution = execution if execution is not None else build_execution(bridge, self.dispatch)
         self._day: Optional[str] = None
         self._day_start = equity
 
@@ -60,6 +64,9 @@ class LiveEngine:
 
     # ---------------- Position lifecycle ----------------
     def _manage(self, symbol: str, candle: Dict) -> None:
+        """Paper-simulated exits; with a live bridge the terminal owns SL/TP."""
+        if self.execution is not None:
+            return
         position = self.positions.get(symbol)
         cfg = ACTIVE_SYMBOLS.get(symbol)
         if position is None or cfg is None:
@@ -111,13 +118,26 @@ class LiveEngine:
             self.positions[symbol] = position
             self.alerts += 1
             self.dispatch.send_alert(signal, verdict)   # only approved setups reach the channel
+            if self.execution is not None:
+                self.execution.submit(signal, verdict)  # atomic order file for the EA
+
+    def _ingest_fills(self) -> None:
+        """Apply terminal receipts: equity from closes, cards from lifecycle events."""
+        if self.execution is None:
+            return
+        for close in self.execution.ingest(self.positions):
+            self.equity += close["pnl"]
+            self.risk.set_equity(self.equity)
+        for reason in self.execution.rejected:
+            self.rejections[reason] += 1
 
     def tick(self, now: Optional[datetime] = None,
              symbols: Optional[List[str]] = None) -> Dict:
-        universe = symbols or [symbol for symbol, cfg in ACTIVE_SYMBOLS.items()
-                               if cfg.asset_class != "synthetic"]
+        universe = symbols if symbols is not None else [symbol for symbol, cfg in ACTIVE_SYMBOLS.items()
+                                                         if cfg.asset_class != "synthetic"]
         stamp = now or datetime.now(UTC)
         day_key = self._roll_day(stamp)
+        self._ingest_fills()
 
         for symbol in universe:
             candles = self.feed.candles(symbol, self.timeframe)
@@ -153,12 +173,25 @@ def main() -> int:
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--timeframe", default="M5")
     parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--feed", choices=("csv", "mt5"), default="csv",
+                        help="csv = offline dry-run bars, mt5 = live terminal bars")
+    parser.add_argument("--bridge", action="store_true",
+                        help="write order files and ingest terminal fill receipts")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build the MT5 feed without touching a terminal")
     parser.add_argument("--once", action="store_true", help="single tick (dry run)")
     args = parser.parse_args()
 
-    engine = LiveEngine(CsvBarFeed(timeframe=args.timeframe), timeframe=args.timeframe)
-    summary = engine.run(interval=args.interval, symbols=args.symbols,
-                          max_iterations=1 if args.once else None)
+    feed = build_feed(args.feed, args.timeframe, SCAN_WINDOW, dry_run=args.dry_run)
+    engine = LiveEngine(feed, timeframe=args.timeframe, bridge=args.bridge)
+    print(f"[ENGINE] feed={args.feed} bridge={'on' if args.bridge else 'off'} "
+          f"files={engine.execution.bridge.root if engine.execution else 'n/a'}")
+    try:
+        summary = engine.run(interval=args.interval, symbols=args.symbols,
+                             max_iterations=1 if args.once else None)
+    finally:
+        if hasattr(feed, "shutdown"):
+            feed.shutdown()
     print("summary:", summary)
     return 0
 

@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 
 from .backtest import Position
 from .data_feed import CsvBarFeed, DEFAULT_WINDOW
+from .mt5_bridge import ExecutionBridge, build_execution
+from .mt5_feed import build_feed
 from .risk_manager import RiskManager
 from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG, SYNTHETIC_UNIVERSE
 from strategies import STRATEGY_REGISTRY, SYNTHETIC_STRATEGIES
@@ -25,7 +27,8 @@ UTC = ZoneInfo("UTC")
 class SyntheticScanner:
     def __init__(self, feed, dispatcher: Optional[TelegramDispatcher] = None,
                  timeframe: str = "M5", equity: float = PROP_CONFIG.BASE_EQUITY,
-                 lookback: int = DEFAULT_WINDOW):
+                 lookback: int = DEFAULT_WINDOW, bridge: bool = False,
+                 execution: Optional[ExecutionBridge] = None):
         self.feed = feed
         self.dispatch = dispatcher if dispatcher is not None else TelegramDispatcher()
         self.timeframe = timeframe
@@ -38,6 +41,7 @@ class SyntheticScanner:
         self.alerts = 0
         self.rejections: Counter = Counter()
         self.max_daily_dd_pct = 0.0
+        self.execution = execution if execution is not None else build_execution(bridge, self.dispatch)
         self._day: Optional[str] = None
         self._day_start = equity
 
@@ -57,6 +61,9 @@ class SyntheticScanner:
         return pct >= PROP_CONFIG.MAX_DAILY_DD_PERCENT
 
     def _manage(self, symbol: str, candle: Dict) -> None:
+        """Paper-simulated exits; with a live bridge the terminal owns SL/TP."""
+        if self.execution is not None:
+            return
         position = self.positions.get(symbol)
         cfg = ACTIVE_SYMBOLS.get(symbol)
         if position is None or cfg is None:
@@ -81,9 +88,10 @@ class SyntheticScanner:
 
     def scan_once(self, now: Optional[datetime] = None,
                   symbols: Optional[List[str]] = None) -> Dict:
-        universe = symbols or SYNTHETIC_UNIVERSE
+        universe = symbols if symbols is not None else SYNTHETIC_UNIVERSE
         stamp = now or datetime.now(UTC)
         day_key = self._roll_day(stamp)
+        self._ingest_fills()
 
         for symbol in universe:
             cfg = ACTIVE_SYMBOLS.get(symbol)
@@ -120,11 +128,23 @@ class SyntheticScanner:
                 self.positions[symbol] = position
                 self.alerts += 1
                 self.dispatch.send_alert(signal, verdict)   # card carries [DERIV SYNTHETICS]
+                if self.execution is not None:
+                    self.execution.submit(signal, verdict)  # atomic order file for the EA
 
         return {"equity": round(self.equity, 2), "alerts": self.alerts,
                 "open_positions": len(self.positions), "day": day_key,
                 "max_daily_dd_pct": round(100 * self.max_daily_dd_pct, 2),
                 "rejections": dict(self.rejections)}
+
+    def _ingest_fills(self) -> None:
+        """Apply terminal receipts: equity from closes, cards from lifecycle events."""
+        if self.execution is None:
+            return
+        for close in self.execution.ingest(self.positions):
+            self.equity += close["pnl"]
+            self.risk.set_equity(self.equity)
+        for reason in self.execution.rejected:
+            self.rejections[reason] += 1
 
     def run(self, interval: int = 30, symbols: Optional[List[str]] = None,
             max_iterations: Optional[int] = None) -> Dict:
@@ -144,14 +164,27 @@ class SyntheticScanner:
 def main() -> int:
     parser = argparse.ArgumentParser(description="PHANTOM-TRADERS 24/7 Deriv synthetic scanner")
     parser.add_argument("--symbols", nargs="*", default=None)
-    parser.add_argument("--timeframe", default="M5")
+    parser.add_argument("--timeframe", default="M1")
     parser.add_argument("--interval", type=int, default=30)
+    parser.add_argument("--feed", choices=("csv", "mt5"), default="csv",
+                        help="csv = offline dry-run bars, mt5 = live terminal ticks")
+    parser.add_argument("--bridge", action="store_true",
+                        help="write order files and ingest terminal fill receipts")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build the MT5 feed without touching a terminal")
     parser.add_argument("--once", action="store_true", help="single scan (dry run)")
     args = parser.parse_args()
 
-    scanner = SyntheticScanner(CsvBarFeed(timeframe=args.timeframe), timeframe=args.timeframe)
-    summary = scanner.run(interval=args.interval, symbols=args.symbols,
-                          max_iterations=1 if args.once else None)
+    feed = build_feed(args.feed, args.timeframe, DEFAULT_WINDOW, dry_run=args.dry_run)
+    scanner = SyntheticScanner(feed, timeframe=args.timeframe, bridge=args.bridge)
+    print(f"[SYNTHETICS] feed={args.feed} bridge={'on' if args.bridge else 'off'} "
+          f"files={scanner.execution.bridge.root if scanner.execution else 'n/a'}")
+    try:
+        summary = scanner.run(interval=args.interval, symbols=args.symbols,
+                              max_iterations=1 if args.once else None)
+    finally:
+        if hasattr(feed, "shutdown"):
+            feed.shutdown()
     print("summary:", summary)
     return 0
 

@@ -13,6 +13,7 @@ class TelegramDispatcher:
     LIFECYCLE_ICONS = {
         "SIGNAL": "📡", "ENTRY": "🟢", "FILLED": "✅",
         "BREAK_EVEN": "🛡", "TP": "💰", "SL": "🛑", "FLAT": "⚖",
+        "REJECTED": "⛔",
     }
     # Strategy identity markers so the channel reads at a glance.
     STRATEGY_ICONS = {"SMC_FIB": "⚡", "Z_SCORE": "🧠", "SYNTH_MOM": "📈"}

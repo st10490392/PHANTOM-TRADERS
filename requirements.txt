@@ -1,3 +1,5 @@
-numpy>=1.26
+﻿numpy>=1.26
 requests>=2.31
 python-dotenv>=1.2
+# Windows-only: live MT5 bars via mt5.copy_rates_from_pos (optional; csv feed works without it)
+MetaTrader5>=8.0

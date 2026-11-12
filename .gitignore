@@ -1,4 +1,4 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
 .pytest_cache/
 .env
@@ -7,3 +7,4 @@ venv/
 *.log
 backtest_results/
 data/
+mt5_bridge/

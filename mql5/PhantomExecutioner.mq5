@@ -1,11 +1,14 @@
 //+------------------------------------------------------------------+
 //| PhantomExecutioner.mq5                                            |
-//| PHANTOM-TRADERS execution bridge: takes validated signal orders   |
-//| from the Python backend (ZeroMQ/Socket/REST) or manual external    |
-//| parameters, sizes volume against the prop-firm risk budget, and    |
-//| guards the account with daily-drawdown and exposure limits.        |
-//|                                                                    |
-//| The Python side owns strategy logic and risk gates; this EA is a   |
+//| PHANTOM-TRADERS execution bridge.                                 |
+//|                                                                   |
+//| Polls <terminal>/MQL5/Files/phantom_bridge/orders/*.json written   |
+//| by the Python engines (core/mt5_bridge.py), validates each command |
+//| against the prop-firm guards, executes it via CTrade, deletes the  |
+//| command file and writes a receipt into phantom_bridge/fills/ so    |
+//| Python can dispatch Telegram lifecycle cards.                      |
+//|                                                                   |
+//| The Python side owns strategy logic and risk sizing; this EA is a   |
 //| dumb executor. Never size or time trades here.                     |
 //+------------------------------------------------------------------+
 #property copyright   "PHANTOM-TRADERS"
@@ -14,34 +17,40 @@
 
 #include <Trade/Trade.mq>
 #include <Trade/PositionInfo.mq>
+#include <Trade/DealInfo.mq>
 
 enum ENUM_ACTION { ACTION_NONE = 0, ACTION_BUY = 1, ACTION_SELL = 2, ACTION_CLOSE = 3 };
 
-input group "Signal parameters"
-input ENUM_ACTION Action      = ACTION_NONE;      // Order action
+input group "Signal parameters (manual override)"
+input ENUM_ACTION Action      = ACTION_NONE;      // Order action (bridge ignores this)
 input string      SymbolName  = "EURUSD";         // Symbol
-input double      Volume      = 0.10;             // Volume (lots, pre-sized by backend)
+input double      Volume      = 0.10;             // Volume (lots)
 input int         StopLoss    = 0;                // Stop loss (points)
 input int         TakeProfit  = 0;                // Take profit (points)
-input int         Magic       = 20260115;         // Magic number
 input int         Slippage    = 3;                // Max deviation (points)
 
+input group "Bridge"
+input string      OrdersFolder = "phantom_bridge\\orders\\"; // Orders folder under MQL5/Files
+input string      FillsFolder  = "phantom_bridge\\fills\\";  // Receipts folder under MQL5/Files
+input int         TimerMs      = 250;                        // Poll interval (ms)
+
 input group "Prop firm risk guard"
-input double      BaseEquity  = 5000.0;           // Base equity (USD)
-input double      RiskPercent = 0.30;             // Risk per trade (%)
-input double      MaxRiskUsd  = 15.0;             // Hard risk cap per trade (USD)
-input double      MaxDailyDd  = 4.0;              // Daily drawdown breach (%)
-input int         MaxOpen     = 2;                // Max open positions
-input int         MaxDailySetups = 3;             // Portfolio daily setup budget
-input double      LotStep     = 0.01;             // Broker lot step
+input double      BaseEquity     = 5000.0;  // Base equity (USD)
+input double      RiskPercent    = 0.30;    // Risk per trade (%)
+input double      MaxRiskUsd     = 15.0;    // Hard risk cap per trade (USD)
+input double      MaxDailyDd     = 4.0;     // Daily drawdown breach (%)
+input int         MaxOpen        = 2;       // Max open positions
+input int         MaxDailySetups = 3;       // Portfolio daily setup budget
+input double      LotStep        = 0.01;    // Broker lot step
+input int         Magic          = 20260115;// Magic number (match PHANTOM_MT5_MAGIC)
 
 CTrade trade;
 
-double dayStartEquity = 0.0;
-int    ordersToday    = 0;
-datetime dayStamp     = 0;
+double   dayStartEquity = 0.0;
+int      ordersToday    = 0;
+datetime dayStamp       = 0;
 
-//--- helpers ----------------------------------------------------------
+//--- guards ------------------------------------------------------------
 double RiskUsd() { return BaseEquity * RiskPercent / 100.0; }
 
 int OpenPositions()
@@ -75,6 +84,12 @@ bool DailyDrawdownBreached()
    return dd >= MaxDailyDd;
 }
 
+double ValuePerPoint(const string symbol)
+{
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   return tickSize > 0.0 ? tickValue / tickSize : 0.0;   // USD per point per lot
+}
 //--- volume safety: never exceed MaxRiskUsd for the supplied stop -------
 double SafeVolume(const string symbol, const int slPoints, const double requested)
 {
@@ -90,7 +105,7 @@ double SafeVolume(const string symbol, const int slPoints, const double requeste
    double minLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
 
-   if(floored < minLot) return 0.0;                 // unaffordable stop -> skip
+   if(floored < minLot) return 0.0;                 // unaffordable stop -> refuse
    return MathMin(MathMax(floored, minLot), MathMin(maxLot, requested));
 }
 
@@ -101,16 +116,148 @@ bool Tradeable(const string symbol)
    return SymbolInfoInteger(symbol, SYMBOL_TRADE_ALLOWED) != 0;
 }
 
-bool ValidOrder(const string symbol, const int action, const double volume,
-                const int sl, const int tp)
+bool GatesOpen(const string symbol)
 {
-   if(action == ACTION_NONE) return false;
    if(!Tradeable(symbol)) return false;
-   if(action != ACTION_CLOSE && (volume <= 0.0 || sl <= 0 || tp <= 0)) return false;
    if(OpenPositions() >= MaxOpen) return false;
    if(DailyDrawdownBreached()) return false;
    if(ordersToday >= MaxDailySetups) return false;
    return true;
+}
+
+//--- bridge plumbing --------------------------------------------------
+string JsonScalar(const string json, const string key)
+{
+   string token = "\"" + key + "\":";
+   int pos = StringFind(json, token);
+   if(pos < 0) return "";
+   string rest = StringSubstr(json, pos + StringLen(token));
+   int comma = StringFind(rest, ",");
+   int brace = StringFind(rest, "}");
+   int cut   = comma < 0 ? brace : (brace < 0 ? comma : MathMin(comma, brace));
+   if(cut < 0) return rest;
+
+   string value = StringSubstr(rest, 0, cut);
+   value = StringReplace(value, "\"", "");
+   StringTrimLeft(value);
+   StringTrimRight(value);
+   return value;
+}
+
+bool ReadText(const string path, string &out)
+{
+   int handle = FileOpen(path, FILE_READ | FILE_COMMON | FILE_TXT);
+   if(handle == INVALID_HANDLE) return false;
+
+   out = "";
+   while(!FileIsEOF(handle))
+   {
+      string line;
+      if(!FileReadString(handle, line)) break;
+      out += line;
+   }
+   FileClose(handle);
+   return true;
+}
+
+void WriteReceipt(const string signal_id, const string event, const string symbol,
+                  const double price, const double volume, const double pnl,
+                  const string note)
+{
+   if(signal_id == "") return;
+   string body = StringFormat(
+      "{\"signal_id\":\"%s\",\"event\":\"%s\",\"symbol\":\"%s\",\"price\":%s,\"volume\":%s,\"pnl\":%s,\"note\":\"%s\"}",
+      signal_id, event, symbol, DoubleToString(price, 5), DoubleToString(volume, 2),
+      DoubleToString(pnl, 2), note);
+
+   string tmp = FillsFolder + signal_id + "-" + event + ".tmp";
+   string dst = FillsFolder + signal_id + "-" + event + ".json";
+   int handle = FileOpen(tmp, FILE_WRITE | FILE_COMMON | FILE_TXT);
+   if(handle == INVALID_HANDLE)
+   {
+      Print("PHANTOM: cannot open receipt ", tmp, " (create MQL5/Files/phantom_bridge/fills)");
+      return;
+   }
+   FileWriteString(handle, body);
+   FileClose(handle);
+   if(!FileMove(tmp, FILE_COMMON, dst, FILE_COMMON))
+      Print("PHANTOM: receipt rename failed for ", signal_id);
+}
+
+bool Execute(const string symbol, const int action, double volume, const int sl,
+             const int tp, const string signal_id, string &reason)
+{
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double price = SymbolInfoDouble(symbol, action == 1 ? SYMBOL_ASK : SYMBOL_BID);
+   volume       = SafeVolume(symbol, sl, volume);
+   if(volume <= 0.0)
+   {
+      reason = "volume refused: stop too wide for broker min lot";
+      return false;
+   }
+
+   string comment = "PHANTOM " + signal_id;
+   bool ok = (action == 1)
+             ? trade.Buy(volume, symbol, price, price - sl * point, price + tp * point, comment)
+             : trade.Sell(volume, symbol, price, price + sl * point, price - tp * point, comment);
+   if(!ok) reason = "trade rejected by terminal (see deal retcode in journal)";
+   return ok;
+}
+
+void ExecuteOrder(const string path)
+{
+   string json;
+   if(!ReadText(path, json))
+   {
+      Print("PHANTOM: cannot read ", path);
+      return;
+   }
+   FileDelete(path, FILE_COMMON);                     // consume once, even if refused
+
+   string signal_id = JsonScalar(json, "signal_id");
+   string symbol    = JsonScalar(json, "symbol");
+   string actionTxt = JsonScalar(json, "action");
+   int    action    = actionTxt == "BUY" ? 1 : (actionTxt == "SELL" ? 2 : 0);
+   double volume    = StringToDouble(JsonScalar(json, "volume"));
+   int    sl        = (int)StringToInteger(JsonScalar(json, "sl"));
+   int    tp        = (int)StringToInteger(JsonScalar(json, "tp"));
+   int    magic     = (int)StringToInteger(JsonScalar(json, "magic"));
+   string strategy  = JsonScalar(json, "strategy");
+
+   if(magic != Magic)
+   {
+      WriteReceipt(signal_id, "REJECTED", symbol, 0.0, 0.0, 0.0, "magic mismatch");
+      return;
+   }
+   if(action == 0 || sl <= 0 || tp <= 0 || volume <= 0.0)
+   {
+      WriteReceipt(signal_id, "REJECTED", symbol, 0.0, 0.0, 0.0, "malformed command");
+      return;
+   }
+   if(!GatesOpen(symbol))
+   {
+      WriteReceipt(signal_id, "REJECTED", symbol, 0.0, 0.0, 0.0,
+                   "guard refused (tradeable/open/DD/daily budget)");
+      return;
+   }
+
+   string reason = "";
+   double fill   = SymbolInfoDouble(symbol, action == 1 ? SYMBOL_ASK : SYMBOL_BID);
+   if(!Execute(symbol, action, volume, sl, tp, signal_id, reason))
+   {
+      WriteReceipt(signal_id, "REJECTED", symbol, 0.0, 0.0, 0.0, reason);
+      return;
+   }
+   ordersToday++;
+   WriteReceipt(signal_id, "FILLED", symbol, fill, volume, 0.0, strategy);
+}
+
+void ProcessOrders()
+{
+   if(!FolderExists(OrdersFolder, FILE_COMMON)) return;
+   string files[];
+   int count = FileListGet(OrdersFolder, FILE_COMMON | FILE_LIST_FILES, files);
+   for(int i = 0; i < count; i++) ExecuteOrder(OrdersFolder + files[i]);
 }
 
 //+------------------------------------------------------------------+
@@ -120,23 +267,30 @@ int OnInit()
    trade.SetDeviationInPoints(Slippage);
    dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    dayStamp       = (datetime)(TimeCurrent() / 86400) * 86400;
-   Print("PHANTOM executor ready: equity=", dayStartEquity, " risk=$", RiskUsd());
+   EventSetMillisecondTimer(TimerMs);
+   Print("PHANTOM executor ready: equity=", dayStartEquity, " risk=$", RiskUsd(),
+         " orders=", OrdersFolder, " fills=", FillsFolder);
    return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) { EventSetTimer(0); }
+
+void OnTimer()
+{
+   RollDay();
+   ProcessOrders();
 }
 
 void OnTick()
 {
    RollDay();
-   if(Action == ACTION_NONE) return;                 // one-shot latch per order request
+   if(Action == ACTION_NONE) return;                 // manual override latch
 
    string symbol = SymbolName;
-   if(!ValidOrder(symbol, (int)Action, Volume, StopLoss, TakeProfit)) return;
+   if(Action != ACTION_CLOSE && (Volume <= 0.0 || StopLoss <= 0 || TakeProfit <= 0)) return;
+   if(!GatesOpen(symbol)) { Action = ACTION_NONE; return; }
 
-   double ask    = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid    = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double point  = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double volume = Action == ACTION_CLOSE ? Volume : SafeVolume(symbol, StopLoss, Volume);
-
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    if(Action == ACTION_CLOSE)
    {
       if(trade.PositionCloseSymbol(symbol, 0, Magic)) ordersToday++;
@@ -144,25 +298,24 @@ void OnTick()
       return;
    }
 
+   double volume = SafeVolume(symbol, StopLoss, Volume);
    if(volume <= 0.0)
    {
-      Print("PHANTOM: volume rejected for ", symbol, " (stop too wide for broker min lot)");
+      Print("PHANTOM: volume refused for ", symbol, " (stop too wide for broker min lot)");
       Action = ACTION_NONE;
       return;
    }
 
-   bool ok = false;
-   if(Action == ACTION_BUY)
-      ok = trade.Buy(volume, symbol, ask, ask - StopLoss * point,
-                     ask + TakeProfit * point, "PHANTOM SMC/Z/ASYNC");
-   else
-      ok = trade.Sell(volume, symbol, bid, bid + StopLoss * point,
-                      bid - TakeProfit * point, "PHANTOM SMC/Z/ASYNC");
-
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   bool ok = Action == ACTION_BUY
+             ? trade.Buy(volume, symbol, ask, ask - StopLoss * point, ask + TakeProfit * point,
+                         "PHANTOM MANUAL")
+             : trade.Sell(volume, symbol, bid, bid + StopLoss * point, bid - TakeProfit * point,
+                           "PHANTOM MANUAL");
    if(ok) ordersToday++;
-   else   Print("PHANTOM: order rejected for ", symbol);
-
-   Action = ACTION_NONE;                             // consume the order
+   else   Print("PHANTOM: manual order rejected for ", symbol);
+   Action = ACTION_NONE;
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -170,7 +323,25 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeResult &result)
 {
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-   Print("PHANTOM deal ", trans.dealType, " ", trans.symbol, " vol=", trans.volume,
-         " price=", trans.price, " retcode=", result.retcode);
+
+   DealInfo deal;
+   if(!deal.select(trans.deal)) return;
+   Print("PHANTOM deal ", deal.entry(), " ", deal.symbol(), " vol=", deal.volume(),
+         " price=", deal.price(), " retcode=", result.retcode);
+
+   string comment   = deal.comment();
+   string signal_id = StringFind(comment, "PHANTOM ") == 0
+                      ? StringReplace(comment, "PHANTOM ", "") : "";
+   double pnl       = deal.profit();
+
+   if(deal.entry() == DEAL_ENTRY_IN)
+      WriteReceipt(signal_id, "FILLED", deal.symbol(), deal.price(), deal.volume(), 0.0, comment);
+   else if(deal.entry() == DEAL_ENTRY_OUT)
+      WriteReceipt(signal_id, pnl >= 0.0 ? "TP" : "SL", deal.symbol(), deal.price(),
+                   deal.volume(), pnl, "closed on terminal");
+   else if(deal.entry() == DEAL_ENTRY_OUT_BY)
+      WriteReceipt(signal_id, "SL", deal.symbol(), deal.price(), deal.volume(), pnl,
+                   "closed by opposing deal");
 }
 //+------------------------------------------------------------------+
+
