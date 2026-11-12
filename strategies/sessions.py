@@ -3,10 +3,14 @@ from datetime import datetime, time
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from config.settings import PROP_CONFIG, SessionBounds, SYNTHETIC_PREFIXES
+from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG, SessionBounds, SYNTHETIC_PREFIXES
 
 
 def is_synthetic(symbol: str) -> bool:
+    """Synthetic = Deriv continuous-tick asset (no session market close)."""
+    cfg = ACTIVE_SYMBOLS.get(symbol)
+    if cfg is not None and cfg.asset_class == "synthetic":
+        return True
     return symbol.startswith(SYNTHETIC_PREFIXES)
 
 

@@ -16,6 +16,7 @@ CURRENCY_MAP = {
     "USDJPY": ["USD", "JPY"], "EURGBP": ["EUR", "GBP"],
     "XAUUSD": ["XAU", "USD"], "US30": ["USD", "IDX"],
     "VOL75": ["SYNTH"], "VOL100": ["SYNTH"], "JUMP100": ["SYNTH"],
+    "STEP100": ["SYNTH"], "BOOM300": ["SYNTH"], "CRASH300": ["SYNTH"],
 }
 
 

@@ -7,18 +7,21 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List
+from typing import Dict, List, Optional
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
+from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG, SYNTHETIC_UNIVERSE
 from core.backtest import BacktestRunner
 from core.data_feed import available_symbols, csv_path, load_candles
+from core.engine import LiveEngine
+from core.engine_synthetics import SyntheticScanner
 from core.risk_manager import RiskManager
 from strategies import sessions as sessions_module
 from strategies.base import Direction, Signal
 from strategies.sessions import active_session
 from strategies.smc_ict_killzone import SMCICTKillzone
+from strategies.synthetic_momentum import SyntheticMomentum
 from strategies.z_score_anchor import ZScoreAnchor
 from telegram import dispatcher as dispatcher_module
 from telegram.dispatcher import TelegramDispatcher
@@ -238,11 +241,17 @@ class TestPhantomInfrastructure(unittest.TestCase):
 
     def test_universe_authorization_map(self):
         """Symbol universe declares which engines may trade each asset class"""
-        self.assertEqual(ACTIVE_SYMBOLS["VOL75"].authorized_strategies, ["Z_SCORE"])
+        self.assertEqual(ACTIVE_SYMBOLS["VOL75"].authorized_strategies, ["Z_SCORE", "SYNTH_MOM"])
         self.assertEqual(ACTIVE_SYMBOLS["VOL75"].asset_class, "synthetic")
         self.assertEqual(ACTIVE_SYMBOLS["US30"].authorized_strategies, ["SMC_FIB"])
         self.assertEqual(ACTIVE_SYMBOLS["XAUUSD"].asset_class, "metal")
         self.assertIn("SMC_FIB", ACTIVE_SYMBOLS["EURUSD"].authorized_strategies)
+        # Continuous-tick indices are momentum-only (no forex session structure).
+        for symbol in ("STEP100", "BOOM300", "CRASH300"):
+            self.assertEqual(ACTIVE_SYMBOLS[symbol].authorized_strategies, ["SYNTH_MOM"])
+        self.assertEqual(set(SYNTHETIC_UNIVERSE),
+                         {symbol for symbol, cfg in ACTIVE_SYMBOLS.items()
+                          if cfg.asset_class == "synthetic"})
 
     # ---------------- Seasonal (DST) shift regression ----------------
     def test_killzone_seasonal_utc_shift(self):
@@ -477,6 +486,161 @@ class TestPhantomInfrastructure(unittest.TestCase):
              patch("requests.post", side_effect=AssertionError("network call attempted")):
             self.assertFalse(TelegramDispatcher.send_alert(signal, {"lot_size": 0.15, "risk_usd": 15.0}))
             self.assertFalse(TelegramDispatcher.send_lifecycle("ENTRY", signal))
+
+    def test_dispatcher_strategy_icons(self):
+        """Cards must visually separate the two engines: ⚡ SMC_FIB vs 🧠 Z_SCORE"""
+        smc = Signal(symbol="EURUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
+                     entry_price=1.10122, stop_loss=1.09734, take_profit=1.10897, risk_reward=2.0,
+                     metadata={"session": "LDN"})
+        anchor = Signal(symbol="XAUUSD", direction=Direction.SELL, strategy_tag="Z_SCORE",
+                        entry_price=2650.0, stop_loss=2680.0, take_profit=2620.0, risk_reward=2.0,
+                        metadata={"session": "NY"})
+        risk = {"lot_size": 0.04, "risk_usd": 15.0}
+
+        smc_card = TelegramDispatcher.format_signal_card(smc, risk)
+        anchor_card = TelegramDispatcher.format_signal_card(anchor, risk)
+
+        self.assertIn("*⚡ Strategy:* `SMC_FIB`", smc_card)
+        self.assertIn("*🧠 Strategy:* `Z_SCORE`", anchor_card)
+        self.assertIn("🟢", smc_card)          # BUY
+        self.assertIn("🔴", anchor_card)       # SELL
+        for card, price in ((smc_card, "`1.10122`"), (anchor_card, "`2650.0`")):
+            self.assertIn(price, card)
+            self.assertIn("`2.0`", card)       # 1:2+ R:R shown
+        self.assertIn("`1.09734`", smc_card)
+        self.assertIn("`1.10897`", smc_card)
+        self.assertIn("`0.04`", smc_card)      # sized lot
+        self.assertIn("$15.0", smc_card)
+
+    def test_dispatcher_marks_deriv_synthetic_cards(self):
+        synth = Signal(symbol="VOL75", direction=Direction.BUY, strategy_tag="SYNTH_MOM",
+                       entry_price=106.0, stop_loss=103.9, take_profit=110.2, risk_reward=2.0,
+                       metadata={"engine": "DERIV_SYNTHETICS", "session": "GLOBAL"})
+        card = TelegramDispatcher.format_signal_card(synth, {"lot_size": 1.0, "risk_usd": 15.0})
+        self.assertIn(TelegramDispatcher.SYNTHETIC_TAG, card)
+        self.assertIn("*📈 Strategy:* `SYNTH_MOM`", card)
+
+        lifecycle = TelegramDispatcher.format_lifecycle_card("TP", synth, 110.2, 15.0)
+        self.assertIn(TelegramDispatcher.SYNTHETIC_TAG, lifecycle)
+        self.assertIn("💰", lifecycle)
+
+
+
+class TestPhantomSyntheticsEngine(unittest.TestCase):
+    """24/7 Deriv scanner, momentum breakout, and engine dispatch wiring."""
+
+    def setUp(self):
+        self.mom = SyntheticMomentum()
+        self.risk = RiskManager(equity=5000.00)
+        self.night = datetime(2025, 1, 15, 22, 30, tzinfo=UTC)   # outside every killzone
+
+    class StubFeed:
+        """Feed adapter implementing the candles(symbol, timeframe) contract."""
+        def __init__(self, candles: Dict[str, List[Dict]]):
+            self.candles_map = candles
+
+        def candles(self, symbol: str, timeframe: Optional[str] = None) -> List[Dict]:
+            return self.candles_map.get(symbol, [])
+
+    def _ramp(self, direction: str = "up") -> List[Dict]:
+        closes = ([100.0] * 40
+                  + [100.0 + 0.3 * i * (1 if direction == "up" else -1) for i in range(1, 21)]
+                  + [107.2 if direction == "up" else 92.8])
+        return candles_from(closes, self.night - timedelta(minutes=60),
+                            step=timedelta(minutes=1), spread=0.5)
+
+    def test_momentum_breakout_long(self):
+        signal = self.mom.analyze(self._ramp("up"), "VOL75", self.night)
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.direction, Direction.BUY)
+        self.assertEqual(signal.strategy_tag, "SYNTH_MOM")
+        self.assertEqual(signal.risk_reward, 2.0)                 # 1:2 floor enforced
+        self.assertEqual(signal.metadata["engine"], "DERIV_SYNTHETICS")
+        self.assertEqual(signal.metadata["session"], "GLOBAL")    # no session filter
+        self.assertGreater(signal.entry_price, signal.metadata["range_extreme"])
+        self.assertGreater(signal.take_profit, signal.entry_price)
+        self.assertLess(signal.stop_loss, signal.entry_price)
+        self.assertTrue(signal.geometry_valid())
+
+    def test_momentum_breakout_short(self):
+        signal = self.mom.analyze(self._ramp("down"), "VOL100", self.night)
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.direction, Direction.SELL)
+        self.assertEqual(signal.metadata["structure"], "BREAKOUT_DOWN")
+        self.assertLess(signal.take_profit, signal.entry_price)
+
+    def test_momentum_cooldown_blocks_repeats(self):
+        candles = self._ramp("up")
+        self.assertIsNotNone(self.mom.analyze(candles, "VOL75", self.night))
+        self.assertIsNone(self.mom.analyze(candles, "VOL75", self.night))   # cooldown latch
+        self.mom.reset("VOL75")
+        self.assertIsNotNone(self.mom.analyze(candles, "VOL75", self.night))
+
+    def test_momentum_ignores_forex_symbols(self):
+        self.assertIsNone(self.mom.analyze(self._ramp("up"), "EURUSD", self.night))
+        self.assertIsNone(self.mom.analyze(self._ramp("up"), "UNKNOWN123", self.night))
+
+    def test_synthetic_currency_cap_shared(self):
+        """All synthetics share one synthetic bucket, so a 3rd one is rejected"""
+        open_pos = [{"symbol": "BOOM300"}, {"symbol": "CRASH300"}]
+        signal = Signal(symbol="STEP100", direction=Direction.BUY, strategy_tag="SYNTH_MOM",
+                        entry_price=100.0, stop_loss=98.0, take_profit=104.0, risk_reward=2.0)
+        self.assertFalse(self.risk.validate_correlation_cap(signal, open_pos))
+
+    def test_scanner_runs_247_and_dispatches_tagged_card(self):
+        posts: List[str] = []
+        scanner = SyntheticScanner(self.StubFeed({"VOL75": self._ramp("up")}), timeframe="M1")
+        with patch.object(TelegramDispatcher, "_post",
+                          side_effect=lambda text: posts.append(text) or True):
+            summary = scanner.scan_once(now=self.night, symbols=["VOL75"])
+
+        self.assertEqual(summary["alerts"], 1)          # fired outside every killzone
+        self.assertEqual(summary["open_positions"], 1)
+        self.assertEqual(len(posts), 1)
+        card = posts[0]
+        self.assertIn(TelegramDispatcher.SYNTHETIC_TAG, card)
+        self.assertIn("*📈 Strategy:* `SYNTH_MOM`", card)
+        self.assertIn("🟢", card)
+        self.assertIn("`107.2`", card)
+        position = scanner.positions["VOL75"]
+        self.assertLessEqual(position.lots, ACTIVE_SYMBOLS["VOL75"].max_lot)
+        self.assertLessEqual(position.risk_usd, PROP_CONFIG.BASE_RISK_AMOUNT)
+
+    def test_engine_dispatches_only_after_risk_gates(self):
+        # Asia pool (00:00-07:00 UTC winter) swept at 08:40, MSS displacement at 08:45.
+        start = datetime(2025, 1, 15, 4, 0, tzinfo=UTC)
+        base = candles_from([1.1000 + 0.0004 * (i % 4) for i in range(20)], start,
+                            step=timedelta(minutes=5), spread=0.0010)
+        sweep = {"time": datetime(2025, 1, 15, 8, 40, tzinfo=UTC), "open": 1.1010,
+                 "high": 1.1012, "low": 1.0950, "close": 1.1000, "volume": 90}
+        displacement = {"time": datetime(2025, 1, 15, 8, 45, tzinfo=UTC), "open": 1.1000,
+                        "high": 1.1045, "low": 1.0997, "close": 1.1040, "volume": 120}
+        candles = base + [sweep, displacement]
+        feed = self.StubFeed({"EURUSD": candles})
+
+        posts: List[str] = []
+        engine = LiveEngine(feed, timeframe="M5")
+        with patch.object(TelegramDispatcher, "_post",
+                          side_effect=lambda text: posts.append(text) or True):
+            summary = engine.tick(now=displacement["time"], symbols=["EURUSD"])
+
+        self.assertEqual(summary["alerts"], 1)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("*⚡ Strategy:* `SMC_FIB`", posts[0])
+        self.assertIn("`2.0`", posts[0])                       # R:R shown on the card
+        self.assertLessEqual(engine.positions["EURUSD"].lots, ACTIVE_SYMBOLS["EURUSD"].max_lot)
+
+        # The same structure outside the killzone must never reach the channel.
+        posts.clear()
+        engine_out = LiveEngine(feed, timeframe="M5")
+        with patch.object(TelegramDispatcher, "_post",
+                          side_effect=lambda text: posts.append(text) or True):
+            outside = engine_out.tick(now=datetime(2025, 1, 15, 12, 0, tzinfo=UTC),
+                                      symbols=["EURUSD"])
+        self.assertEqual(outside["alerts"], 0)
+        self.assertEqual(posts, [])
 
 
 class TestPhantomDataPipeline(unittest.TestCase):

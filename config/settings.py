@@ -78,13 +78,23 @@ ACTIVE_SYMBOLS: Dict[str, SymbolConfig] = {
                            contract_size=100.0, point_value=0.01, asset_class="metal"),
     "US30": SymbolConfig("US30", ["SMC_FIB"],
                          contract_size=1.0, point_value=1.0, asset_class="index"),
-    "VOL75": SymbolConfig("VOL75", ["Z_SCORE"],
+    "VOL75": SymbolConfig("VOL75", ["Z_SCORE", "SYNTH_MOM"],
                           contract_size=1.0, point_value=0.01, asset_class="synthetic"),
-    "VOL100": SymbolConfig("VOL100", ["Z_SCORE"],
+    "VOL100": SymbolConfig("VOL100", ["Z_SCORE", "SYNTH_MOM"],
                            contract_size=1.0, point_value=0.01, asset_class="synthetic"),
-    "JUMP100": SymbolConfig("JUMP100", ["Z_SCORE"],
+    "JUMP100": SymbolConfig("JUMP100", ["Z_SCORE", "SYNTH_MOM"],
                             contract_size=1.0, point_value=0.01, asset_class="synthetic"),
+    "STEP100": SymbolConfig("STEP100", ["SYNTH_MOM"],
+                            contract_size=1.0, point_value=0.01, asset_class="synthetic"),
+    "BOOM300": SymbolConfig("BOOM300", ["SYNTH_MOM"],
+                            contract_size=1.0, point_value=0.01, asset_class="synthetic"),
+    "CRASH300": SymbolConfig("CRASH300", ["SYNTH_MOM"],
+                             contract_size=1.0, point_value=0.01, asset_class="synthetic"),
 }
+
+# Deriv synthetic universe (continuous ticks, no market close).
+SYNTHETIC_UNIVERSE: List[str] = [symbol for symbol, cfg in ACTIVE_SYMBOLS.items()
+                                if cfg.asset_class == "synthetic"]
 
 # Deriv synthetic prefixes are monitored 24/7 (no forex session filters).
 SYNTHETIC_PREFIXES = ("VOL", "JUMP", "BOOM", "CRASH")

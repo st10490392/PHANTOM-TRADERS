@@ -61,3 +61,29 @@ def load_candles(symbol: str, timeframe: str = "M5", data_dir: Path = DATA_DIR,
 def window_at(candles: List[Dict], index: int, lookback: int = DEFAULT_WINDOW) -> List[Dict]:
     """Bounded trailing window, mirroring what a live feed supplies per tick."""
     return candles[max(0, index - lookback + 1):index + 1]
+
+
+class CsvBarFeed:
+    """
+    Bar feed over CSV datasets. Live adapters (MT5 ZeroMQ bridge, broker REST/Deriv WS)
+    only need to expose candles(symbol, timeframe) -> List[Dict], so the engines and
+    scanners stay backend-agnostic.
+    """
+
+    def __init__(self, data_dir: Path = DATA_DIR, timeframe: str = "M5",
+                 lookback: int = DEFAULT_WINDOW):
+        self.data_dir = Path(data_dir)
+        self.timeframe = timeframe
+        self.lookback = lookback
+        self._cache: Dict[str, List[Dict]] = {}
+
+    def candles(self, symbol: str, timeframe: Optional[str] = None) -> List[Dict]:
+        timeframe = timeframe or self.timeframe
+        key = f"{symbol}_{timeframe}"
+        if key not in self._cache:
+            self._cache[key] = load_candles(symbol, timeframe, self.data_dir)
+        bars = self._cache[key]
+        return window_at(bars, len(bars) - 1, self.lookback) if bars else []
+
+    def symbols(self) -> List[str]:
+        return available_symbols(self.data_dir, self.timeframe)

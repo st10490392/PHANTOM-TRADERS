@@ -14,15 +14,28 @@ class TelegramDispatcher:
         "SIGNAL": "📡", "ENTRY": "🟢", "FILLED": "✅",
         "BREAK_EVEN": "🛡", "TP": "💰", "SL": "🛑", "FLAT": "⚖",
     }
+    # Strategy identity markers so the channel reads at a glance.
+    STRATEGY_ICONS = {"SMC_FIB": "⚡", "Z_SCORE": "🧠", "SYNTH_MOM": "📈"}
+    SYNTHETIC_TAG = "[DERIV SYNTHETICS]"
+
+    @classmethod
+    def strategy_icon(cls, strategy_tag: str) -> str:
+        return cls.STRATEGY_ICONS.get(strategy_tag, "📡")
 
     @staticmethod
-    def format_signal_card(signal: Signal, risk_data: Dict) -> str:
+    def _is_synthetic(signal: Signal) -> bool:
+        return signal.metadata.get("engine") == "DERIV_SYNTHETICS"
+
+    @classmethod
+    def format_signal_card(cls, signal: Signal, risk_data: Dict) -> str:
         icon = "🟢" if signal.direction.value == "BUY" else "🔴"
+        badge = cls.strategy_icon(signal.strategy_tag)
+        engine = f"\n{cls.SYNTHETIC_TAG}" if cls._is_synthetic(signal) else ""
 
         text = f"""
 *{icon} PHANTOM SIGNAL | {signal.symbol}*
 ━━━━━━━━━━━━━━━━━━━━
-*Strategy:* `{signal.strategy_tag}`
+*{badge} Strategy:* `{signal.strategy_tag}`
 *Direction:* `{signal.direction.value}`
 *R:R Ratio:* `{signal.risk_reward}`
 
@@ -33,19 +46,21 @@ class TelegramDispatcher:
 *Lot Size:* `{risk_data.get('lot_size', 0.0)}`
 *Risk Budget:* `${risk_data.get('risk_usd', 0.0)}`
 _Session:_ `{signal.metadata.get('session', 'N/A')}`
-_Metadata:_ {signal.metadata}
+```{signal.metadata}`{engine}
         """.strip()
         return text
 
-    @staticmethod
-    def format_lifecycle_card(event: str, signal: Signal, fill_price: Optional[float] = None,
+    @classmethod
+    def format_lifecycle_card(cls, event: str, signal: Signal, fill_price: Optional[float] = None,
                               pnl: Optional[float] = None, note: str = "") -> str:
         """Lifecycle updates: ENTRY -> FILLED -> BREAK_EVEN -> TP/SL."""
-        icon = TelegramDispatcher.LIFECYCLE_ICONS.get(event, "ℹ")
+        icon = cls.LIFECYCLE_ICONS.get(event, "ℹ")
+        badge = cls.strategy_icon(signal.strategy_tag)
+        engine = f" {cls.SYNTHETIC_TAG}" if cls._is_synthetic(signal) else ""
         lines = [
-            f"{icon} PHANTOM LIFECYCLE | `{event}` | {signal.symbol}",
+            f"{icon} PHANTOM LIFECYCLE | `{event}` | {signal.symbol}{engine}",
             "━━━━━━━━━━━━━━━━━━━━",
-            f"*Strategy:* `{signal.strategy_tag}`  *Direction:* `{signal.direction.value}`",
+            f"*{badge} Strategy:* `{signal.strategy_tag}`  *Direction:* `{signal.direction.value}`",
             f"*Signal Entry:* `{signal.entry_price}`",
         ]
         if fill_price is not None:
@@ -59,7 +74,8 @@ _Metadata:_ {signal.metadata}
 
     @classmethod
     def _post(cls, text: str) -> bool:
-        if TELEGRAM_BOT_TOKEN.startswith("YOUR_") or TELEGRAM_CHAT_ID.startswith("YOUR_"):
+        if (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID
+                or TELEGRAM_BOT_TOKEN.startswith("YOUR_") or TELEGRAM_CHAT_ID.startswith("YOUR_")):
             print("[TELEGRAM DISPATCH SKIPPED] bot token / chat id not configured")
             return False
 

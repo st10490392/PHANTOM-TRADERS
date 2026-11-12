@@ -7,11 +7,18 @@ Backend-agnostic trading infrastructure for a **$5,000 instant-funding prop acco
 PHANTOM-TRADERS/
 ├── config/settings.py          # prop-firm constants, symbol universe, DST timezones
 ├── strategies/base.py          # Strategy ABC + Signal contract
-├── strategies/smc_ict_killzone.py  # Forex/Gold/Indices engine (SMC/ICT + OTE)
-├── strategies/z_score_anchor.py    # Statistical anchor + Deriv synthetic 24/7 engine
+├── strategies/sessions.py      # shared DST-aware killzone clock (zoneinfo)
+├── strategies/smc_ict_killzone.py   # Forex/Gold/Indices engine (SMC/ICT + OTE)
+├── strategies/z_score_anchor.py     # Statistical anchor (forex bonus + synthetics)
+├── strategies/synthetic_momentum.py # Deriv rolling-range breakout / momentum
 ├── core/risk_manager.py        # correlation caps, daily DD gate, exact lot sizing
+├── core/data_feed.py           # CSV bar feed adapter (live adapters share the contract)
+├── core/backtest.py            # offline replay through the live gates
+├── core/engine.py              # live runner: session engine -> risk gates -> dispatcher
+├── core/engine_synthetics.py   # 24/7 Deriv background scanner
 ├── telegram/dispatcher.py      # Markdown signal cards + lifecycle updates
-└── tests/test_suite.py         # killzones, risk math, caps, formatting
+├── mql5/PhantomExecutioner.mq5 # MT5 execution EA (order params + prop-firm guards)
+└── tests/test_suite.py         # killzones, risk math, caps, scanner, formatting
 ```
 
 ## Engines
@@ -20,6 +27,7 @@ PHANTOM-TRADERS/
 | --- | --- | --- | --- |
 | **SMC/ICT Killzone** (`SMC_FIB`) | EURUSD, GBPUSD, USDJPY, EURGBP, XAUUSD, US30 | London 07:00–10:00 local, NY 13:30–16:30 local (DST-aware via `zoneinfo`) | Judas sweep of the prior session pool + MSS displacement, entry at OTE 0.618, ATR-buffered stop behind the extreme, hard 1:2.0 R:R |
 | **Deriv Synthetics** (`Z_SCORE`) | VOL75, VOL100, JUMP100 | none — 24/7 continuous volatility/momentum tracking | 100-bar z-score stretch ≥ 2σ, edge-triggered, target = statistical mean, 3σ catastrophic stop |
+| **Deriv Momentum** (`SYNTH_MOM`) | VOL75, VOL100, JUMP100, STEP100, BOOM300, CRASH300 | none — continuous ticks, no market close | rolling 60-bar range breakout ≥ 0.6×ATR confirmed by least-squares slope, ATR-scaled SL/TP at hard 1:2 R:R, 48-bar cooldown |
 | **Bonus Alerts** (`Z_SCORE`) | EURUSD, GBPUSD, XAUUSD | London/NY killzones only | same anchor, tagged `FOREX_CORE`; one alert per stretch until mean reversion re-arms it |
 
 Both engines share `strategies/sessions.py`, so the killzone clock has a single source of truth.
@@ -48,6 +56,34 @@ python -m core.backtest --symbols EURUSD XAUUSD --timeframe M5 --no-write
 The replay drives the same path as live: candles → `analyze()` → `validate_signal()` → position lifecycle
 (SL fills before TP within a bar) → per-symbol/per-strategy JSON written to `PHANTOM_RESULTS_DIR`.
 
+## Live runners
+
+Both runners take any object implementing `candles(symbol, timeframe) -> List[Dict]`
+(`CsvBarFeed` for CSV datasets, a live adapter for MT5/REST/Deriv WS), apply the same
+risk gates as the replay, and dispatch only approved setups to Telegram.
+
+```bash
+python -m core.engine --interval 60                 # session engine (SMC_FIB + Z_SCORE)
+python -m core.engine --once --symbols EURUSD       # single dry tick
+python -m core.engine_synthetics --interval 30      # 24/7 Deriv scanner (SYNTH_MOM + Z_SCORE)
+python -m core.engine_synthetics --once             # single dry scan
+```
+
+Cards distinguish the engines: `⚡ SMC_FIB`, `🧠 Z_SCORE`, `📈 SYNTH_MOM`, and synthetic
+cards carry a `[DERIV SYNTHETICS]` badge. Lifecycle cards (`ENTRY`, `FILLED`, `BREAK_EVEN`,
+`TP`, `SL`) reuse the originating signal.
+
+## MT5 execution
+
+`mql5/PhantomExecutioner.mq5` is the execution side of the bridge. It is deliberately dumb:
+the Python backend decides *what* and *when*, the EA only places the order. External inputs
+are `Action`, `SymbolName`, `Volume`, `StopLoss`, `TakeProfit` (points), `Magic`, plus prop-firm
+guards (`BaseEquity`, `RiskPercent`, `MaxRiskUsd`, `MaxDailyDd`, `MaxOpen`, `MaxDailySetups`,
+`LotStep`). `SafeVolume()` re-floors the incoming volume against the supplied stop so a stale
+input can never breach the $15 budget, and orders are refused when the symbol is untradeable,
+the position/DDE/setup caps are hit, or the stop needs less than the broker's minimum lot.
+Compile it in MetaEditor and drive `Action` from your ZeroMQ/Socket handler.
+
 ## Usage
 
 ```bash
@@ -75,16 +111,18 @@ if signal:
 
 Candles arrive as `[{'time': tz-aware datetime, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': int}]`, so the same engines serve:
 
-* **MQL5/MT5** — a ZeroMQ REP socket in `core/` feeding bars from an EA and returning validated signal JSON back to the terminal for execution.
+* **MQL5/MT5** — `mql5/PhantomExecutioner.mq5` executes validated orders; a ZeroMQ REP socket
+  in `core/` feeds bars from an EA and returns validated signal JSON back to the terminal.
+  `LiveEngine`/`SyntheticScanner` accept a socket-backed feed without any strategy changes.
 * **Python REST broker API** — pass candles from your data feed, call `analyze()`, then `validate_signal()` before order placement.
 * **Deriv** — synthetics bypass session filters (`asset_class == "synthetic"`), sizing uses `contract_size`/`point_value`.
 
 ## Secrets
 
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read from the environment or an untracked
-`.env` beside `config/settings.py` (loaded via `python-dotenv`; real env vars win). Placeholders
-keep `send_alert()` a no-op instead of a crash. `config/settings.py` reads `os.getenv` and
-`.gitignore` excludes `.env` — never commit a bot token.
+`.env` beside `config/settings.py` (loaded via `python-dotenv`; real env vars win). Missing,
+empty or placeholder credentials keep `send_alert()` a no-op instead of a crash or a live post.
+`config/settings.py` reads `os.getenv` and `.gitignore` excludes `.env` — never commit a bot token.
 
 ```bash
 cp .env.example .env   # then fill in BotFather token + channel id (channels use negative ids)

@@ -17,6 +17,7 @@ from config.settings import ACTIVE_SYMBOLS, DATA_DIR, PROP_CONFIG, RESULTS_DIR
 from core.data_feed import available_symbols, load_candles, window_at
 from core.risk_manager import RiskManager
 from strategies import STRATEGY_REGISTRY
+from strategies.base import Signal
 
 UTC = ZoneInfo("UTC")
 SCAN_WINDOW = 200
@@ -33,6 +34,7 @@ class Position:
     lots: float
     risk_usd: float
     opened_at: datetime
+    signal: Optional[Signal] = None    # originating signal, reused by lifecycle cards
 
 
 @dataclass
