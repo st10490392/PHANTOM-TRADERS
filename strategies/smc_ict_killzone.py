@@ -7,7 +7,7 @@ ATR-buffered stops behind the sweep extreme, hard 1:2.0 R:R floor.
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from .base import Direction, Signal, Strategy
-from .sessions import active_session, bounds_to_times
+from .sessions import active_session, bounds_to_times, clock
 from config.settings import PROP_CONFIG, SessionBounds
 
 
@@ -36,7 +36,6 @@ class SMCICTKillzone(Strategy):
         Liquidity pool targets: London sweeps the Asia range, NY sweeps the London range.
         Falls back to a lookback window when the backend omits session candles.
         """
-        london_local = dt_utc.astimezone(PROP_CONFIG.TIMEZONE_LONDON).time()
         window: Optional[SessionBounds] = None
         if session == "LDN":
             window = PROP_CONFIG.ASIA_SESSION
@@ -47,7 +46,7 @@ class SMCICTKillzone(Strategy):
         if window is not None:
             start, end = bounds_to_times(window)
             for candle in candles[:-2]:
-                local = candle["time"].astimezone(PROP_CONFIG.TIMEZONE_LONDON).time()
+                local = clock(candle["time"], PROP_CONFIG.TIMEZONE_LONDON)
                 if start <= local <= end:
                     pool.append(candle)
 

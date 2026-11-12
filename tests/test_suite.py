@@ -3,6 +3,7 @@ PHANTOM-TRADERS Unit Test Suite
 Covers Killzones, Risk Math, Correlation Caps, and Formatting
 """
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +15,7 @@ from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
 from core.backtest import BacktestRunner
 from core.data_feed import available_symbols, csv_path, load_candles
 from core.risk_manager import RiskManager
+from strategies import sessions as sessions_module
 from strategies.base import Direction, Signal
 from strategies.sessions import active_session
 from strategies.smc_ict_killzone import SMCICTKillzone
@@ -285,6 +287,26 @@ class TestPhantomInfrastructure(unittest.TestCase):
         self.assertEqual(eu_after.utcoffset(), timedelta(hours=1))
         self.assertEqual(us_before.utcoffset(), timedelta(hours=-5))
         self.assertEqual(us_after.utcoffset(), timedelta(hours=-4))
+
+    def test_killzone_fixed_utc_mode(self):
+        """UTC_FIXED mode pins London to 07:00-10:00 UTC and NY to 13:30-16:30 UTC all year"""
+        fixed = replace(PROP_CONFIG, KILLZONE_MODE="UTC_FIXED")
+        cases = [
+            (datetime(2026, 1, 15, 7, 0, tzinfo=UTC), "LDN"),      # winter boundary
+            (datetime(2026, 7, 15, 7, 0, tzinfo=UTC), "LDN"),      # BST season stays pinned
+            (datetime(2026, 7, 15, 6, 0, tzinfo=UTC), None),       # DST mode would call this LDN
+            (datetime(2026, 7, 15, 10, 1, tzinfo=UTC), None),
+            (datetime(2026, 1, 15, 13, 30, tzinfo=UTC), "NY"),     # EST season
+            (datetime(2026, 7, 15, 13, 30, tzinfo=UTC), "NY"),     # EDT season
+            (datetime(2026, 7, 15, 16, 30, tzinfo=UTC), "NY"),     # inclusive close
+            (datetime(2026, 7, 15, 16, 31, tzinfo=UTC), None),
+        ]
+        with patch.object(sessions_module, "PROP_CONFIG", fixed):
+            for instant, expected in cases:
+                self.assertEqual(active_session(instant, "EURUSD"), expected, msg=f"{instant:%H:%M} UTC")
+
+        # Default mode shifts with the season instead of staying pinned.
+        self.assertEqual(active_session(datetime(2026, 7, 15, 6, 0, tzinfo=UTC), "EURUSD"), "LDN")
 
     def test_sessions_module_matches_engine_gate(self):
         """Shared clock is the single source of truth for every engine"""

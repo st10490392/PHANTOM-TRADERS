@@ -23,6 +23,8 @@ PHANTOM-TRADERS/
 | **Bonus Alerts** (`Z_SCORE`) | EURUSD, GBPUSD, XAUUSD | London/NY killzones only | same anchor, tagged `FOREX_CORE`; one alert per stretch until mean reversion re-arms it |
 
 Both engines share `strategies/sessions.py`, so the killzone clock has a single source of truth.
+`PHANTOM_KILLZONE_MODE` selects the clock: `DST_LOCAL` (default, zoneinfo applies the seasonal
+shift) or `UTC_FIXED` (bounds pinned to London 07:00–10:00 UTC / NY 13:30–16:30 UTC all year).
 
 ## Risk Rules
 

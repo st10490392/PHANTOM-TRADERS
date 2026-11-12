@@ -34,6 +34,14 @@ class PropFirmConfig:
     MAX_DAILY_SETUPS_PER_SYMBOL: int = 2   # alert/execution budget per asset
     MAX_DAILY_SETUPS_TOTAL: int = 3        # portfolio-wide daily budget
 
+    # Killzone clock mode:
+    #   "DST_LOCAL" - bounds are session-local wall clock times; zoneinfo applies the
+    #                 seasonal shift (London 07:00-10:00 local = 07:00-10:00 UTC winter,
+    #                 06:00-09:00 UTC summer).
+    #   "UTC_FIXED" - bounds are compared against UTC directly, pinning London to
+    #                 07:00-10:00 UTC and New York to 13:30-16:30 UTC all year.
+    KILLZONE_MODE: str = getenv("PHANTOM_KILLZONE_MODE", "DST_LOCAL")
+
     # Killzone bounds are SESSION LOCAL wall-clock times (hour, minute).
     # zoneinfo converts them against UTC every tick, so DST shifts are handled
     # automatically: London 07:00-10:00 local, New York 13:30-16:30 local.
