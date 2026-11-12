@@ -4,10 +4,11 @@ DST-Aware London & NY Killzones | Prior-Session Liquidity Sweeps
 Judas Swing + MSS Displacement | OTE 0.618-0.786 Retracements
 ATR-buffered stops behind the sweep extreme, hard 1:2.0 R:R floor.
 """
-from datetime import datetime, time
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from .base import Direction, Signal, Strategy
-from config.settings import PROP_CONFIG, SessionBounds, SYNTHETIC_PREFIXES
+from .sessions import active_session, bounds_to_times
+from config.settings import PROP_CONFIG, SessionBounds
 
 
 class SMCICTKillzone(Strategy):
@@ -25,28 +26,9 @@ class SMCICTKillzone(Strategy):
         return self.NAME
 
     # ---------------- Session / Killzone Filters ----------------
-    @staticmethod
-    def _bounds_to_times(bounds: SessionBounds) -> Tuple[time, time]:
-        return time(*bounds[0]), time(*bounds[1])
-
-    @staticmethod
-    def _within(bounds: SessionBounds, local: time) -> bool:
-        start, end = SMCICTKillzone._bounds_to_times(bounds)
-        return start <= local <= end
-
     def _active_session(self, dt_utc: datetime, symbol: str) -> Optional[str]:
-        """DST-aware killzone gate. Synthetics run 24/7, so they report 'GLOBAL'."""
-        if symbol.startswith(SYNTHETIC_PREFIXES):
-            return "GLOBAL"
-
-        london_local = dt_utc.astimezone(PROP_CONFIG.TIMEZONE_LONDON).time()
-        ny_local = dt_utc.astimezone(PROP_CONFIG.TIMEZONE_NY).time()
-
-        if self._within(PROP_CONFIG.LONDON_KILLZONE, london_local):
-            return "LDN"
-        if self._within(PROP_CONFIG.NY_KILLZONE, ny_local):
-            return "NY"
-        return None
+        """DST-aware killzone gate; synthetics run 24/7 and report 'GLOBAL'."""
+        return active_session(dt_utc, symbol)
 
     def _prior_session_extremes(self, candles: List[Dict], dt_utc: datetime,
                                  session: str) -> Optional[Tuple[float, float]]:
@@ -63,7 +45,7 @@ class SMCICTKillzone(Strategy):
 
         pool: List[Dict] = []
         if window is not None:
-            start, end = self._bounds_to_times(window)
+            start, end = bounds_to_times(window)
             for candle in candles[:-2]:
                 local = candle["time"].astimezone(PROP_CONFIG.TIMEZONE_LONDON).time()
                 if start <= local <= end:

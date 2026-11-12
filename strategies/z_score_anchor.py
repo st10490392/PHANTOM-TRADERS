@@ -1,8 +1,8 @@
 """
-Statistical Mean-Reversion Anchor (Forex/Gold bonus alerts + Deriv Synthetics engine)
-2+ standard deviation stretch for high-liquidity assets.
-Deriv synthetics carry no forex sessions, so this anchor runs 24/7 with a
-volatility/momentum regime filter instead of a killzone gate.
+Statistical Mean-Reversion Anchor
+Verified 2+ standard deviation stretch alert (high-liquidity assets + Deriv synthetics).
+Gating: forex alerts fire only inside London/NY killzones; Deriv synthetics run 24/7.
+Edge-triggered with a per-symbol cooldown so a single stretch cannot re-fire every bar.
 """
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -10,7 +10,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .base import Direction, Signal, Strategy
-from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG, SYNTHETIC_PREFIXES
+from .sessions import active_session, is_synthetic
+from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
 
 
 class ZScoreAnchor(Strategy):
@@ -18,18 +19,34 @@ class ZScoreAnchor(Strategy):
     LOOKBACK = 100
     ENTRY_Z = 2.0
     EXIT_Z = 0.0
+    COOLDOWN_BARS = 96       # one 8h M5 stretch may not re-alert every bar
     MOMENTUM_WINDOW = 20
-    MAX_MOMENTUM_SIGMAS = 2.0  # reject counter-trend stretches already exhausted
+
+    def __init__(self) -> None:
+        self._bars: Dict[str, int] = {}
+        self._armed: Dict[str, bool] = {}
+        self._last_fire: Dict[str, int] = {}
 
     @property
     def name(self) -> str:
         return self.NAME
 
+    def reset(self, symbol: Optional[str] = None) -> None:
+        """Clear edge-trigger state (call at session/day boundaries or on resync)."""
+        if symbol is None:
+            self._bars.clear()
+            self._armed.clear()
+            self._last_fire.clear()
+        else:
+            self._bars.pop(symbol, None)
+            self._armed.pop(symbol, None)
+            self._last_fire.pop(symbol, None)
+
     def _is_synthetic(self, symbol: str) -> bool:
         cfg = ACTIVE_SYMBOLS.get(symbol)
         if cfg is not None and cfg.asset_class == "synthetic":
             return True
-        return symbol.startswith(SYNTHETIC_PREFIXES)
+        return is_synthetic(symbol)
 
     def _momentum(self, closes: np.ndarray) -> Tuple[float, float]:
         """Least-squares slope (price/bar) plus residual volatility of the window."""
@@ -43,6 +60,13 @@ class ZScoreAnchor(Strategy):
         if len(candles) < self.LOOKBACK:
             return None
 
+        synthetic = self._is_synthetic(symbol)
+
+        # Forex/Gold/Indices bonus alerts are killzone-scoped; synthetics are 24/7.
+        session = active_session(current_time_utc, symbol)
+        if session is None:
+            return None
+
         closes = np.array([c["close"] for c in candles[-self.LOOKBACK:]], dtype=float)
         mean = float(np.mean(closes))
         std = float(np.std(closes))
@@ -51,6 +75,19 @@ class ZScoreAnchor(Strategy):
 
         price = float(closes[-1])
         current_z = (price - mean) / std
+
+        bar = self._bars.get(symbol, 0) + 1
+        self._bars[symbol] = bar
+
+        # Edge trigger: re-arm only once the stretch has mean-reverted back inside
+        # the entry band (|z| < ENTRY_Z); a persistent stretch must not re-alert.
+        if abs(current_z) < self.ENTRY_Z:
+            self._armed[symbol] = True
+        if not self._armed.get(symbol, True):
+            return None
+        last_fire = self._last_fire.get(symbol)
+        if last_fire is not None and bar - last_fire < self.COOLDOWN_BARS:
+            return None
 
         # Mean reversion setup
         if current_z <= -self.ENTRY_Z:
@@ -64,14 +101,15 @@ class ZScoreAnchor(Strategy):
         else:
             return None
 
-        # Volatility/momentum regime context for the Deriv 24/7 engine (advisory only:
-        # the stretch itself is the trigger, so it is reported, never filtered here).
-        slope, residual = self._momentum(closes)
-        momentum_sigmas = abs(slope) * self.MOMENTUM_WINDOW / std if std else 0.0
-
         risk = abs(price - stop_loss)
         reward = abs(take_profit - price)
         rr = round(reward / risk, 2) if risk > 0 else 0.0
+
+        self._armed[symbol] = False
+        self._last_fire[symbol] = bar
+
+        slope, residual = self._momentum(closes)
+        momentum_sigmas = abs(slope) * self.MOMENTUM_WINDOW / std if std else 0.0
 
         return Signal(
             symbol=symbol,
@@ -88,9 +126,10 @@ class ZScoreAnchor(Strategy):
                 "momentum_slope": round(slope, 6),
                 "momentum_sigmas": round(momentum_sigmas, 2),
                 "residual_sigma": round(residual, 5),
-                "engine": "DERIV_SYNTHETICS" if self._is_synthetic(symbol) else "FOREX_CORE",
-                "session": "GLOBAL" if self._is_synthetic(symbol) else "LDN/NY",
+                "engine": "DERIV_SYNTHETICS" if synthetic else "FOREX_CORE",
+                "session": session,
                 "exit_z": self.EXIT_Z,
+                "cooldown_bars": self.COOLDOWN_BARS,
                 "daily_risk_usd": PROP_CONFIG.BASE_RISK_AMOUNT,
             },
         )

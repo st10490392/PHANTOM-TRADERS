@@ -19,22 +19,38 @@ PHANTOM-TRADERS/
 | Engine | Symbols | Gate | Trigger |
 | --- | --- | --- | --- |
 | **SMC/ICT Killzone** (`SMC_FIB`) | EURUSD, GBPUSD, USDJPY, EURGBP, XAUUSD, US30 | London 07:00–10:00 local, NY 13:30–16:30 local (DST-aware via `zoneinfo`) | Judas sweep of the prior session pool + MSS displacement, entry at OTE 0.618, ATR-buffered stop behind the extreme, hard 1:2.0 R:R |
-| **Deriv Synthetics** (`Z_SCORE`) | VOL75, VOL100, JUMP100 | none — 24/7 continuous volatility/momentum tracking | 100-bar z-score stretch ≥ 2σ, target = statistical mean, 3σ catastrophic stop |
-| **Bonus Alerts** (`Z_SCORE`) | EURUSD, GBPUSD, XAUUSD | none (high-liquidity assets) | same anchor, tagged `FOREX_CORE` |
+| **Deriv Synthetics** (`Z_SCORE`) | VOL75, VOL100, JUMP100 | none — 24/7 continuous volatility/momentum tracking | 100-bar z-score stretch ≥ 2σ, edge-triggered, target = statistical mean, 3σ catastrophic stop |
+| **Bonus Alerts** (`Z_SCORE`) | EURUSD, GBPUSD, XAUUSD | London/NY killzones only | same anchor, tagged `FOREX_CORE`; one alert per stretch until mean reversion re-arms it |
+
+Both engines share `strategies/sessions.py`, so the killzone clock has a single source of truth.
 
 ## Risk Rules
 
 * `$5,000 × 0.30% = $15` base risk model, clamped to the **0.25%–0.50%** band.
 * **Correlation cap:** at most 2 open positions sharing one currency (`USD`, `EUR`, …).
-* **Daily drawdown:** the gate blocks new trades once equity is 4% below the day's start.
-* **Lot sizing:** `risk / (sl_distance × contract_size)`, snapped to the broker lot step and clamped to `min_lot`/`max_lot`.
+* **Daily drawdown:** the gate blocks new trades once equity is 4% below the day's UTC-midnight anchor.
+* **Setup budget:** 2 approved setups/day per asset, 3/day portfolio-wide (`MAX_DAILY_SETUPS_*`).
+* **Lot sizing:** `floor(risk / (sl_distance × contract_size) / min_lot) × min_lot`, then clamped to `max_lot`. Snapping **floors**, so realized risk can only come *under* the $15 budget; a stop that needs less than `min_lot` is rejected instead of upsized.
 * Live equity feeds go through `RiskManager.set_equity()`, which refuses stale or news-skewed balances outside a ±25% band.
+
+## Historical replay
+
+Bar files are `<SYMBOL>_<TIMEFRAME>.csv` (`time,open,high,low,close[,volume]`, `time` = epoch seconds UTC).
+Point `PHANTOM_DATA_DIR` at that directory (via `.env` or the environment), then:
+
+```bash
+python -m core.backtest --days 90 --source metaquotes_demo
+python -m core.backtest --symbols EURUSD XAUUSD --timeframe M5 --no-write
+```
+
+The replay drives the same path as live: candles → `analyze()` → `validate_signal()` → position lifecycle
+(SL fills before TP within a bar) → per-symbol/per-strategy JSON written to `PHANTOM_RESULTS_DIR`.
 
 ## Usage
 
 ```bash
 pip install -r requirements.txt
-python -m unittest tests.test_suite -v
+python -m pytest -v          # or: python -m unittest tests.test_suite -v
 ```
 
 ```python

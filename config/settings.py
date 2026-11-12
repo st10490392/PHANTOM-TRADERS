@@ -31,6 +31,8 @@ class PropFirmConfig:
     MAX_DAILY_DD_PERCENT: float = 0.04     # 4% hard breach buffer
     MAX_CORRELATED_POSITIONS: int = 2      # global shared-currency cap
     MAX_OPEN_POSITIONS: int = 2            # 1-2 setups/day frequency
+    MAX_DAILY_SETUPS_PER_SYMBOL: int = 2   # alert/execution budget per asset
+    MAX_DAILY_SETUPS_TOTAL: int = 3        # portfolio-wide daily budget
 
     # Killzone bounds are SESSION LOCAL wall-clock times (hour, minute).
     # zoneinfo converts them against UTC every tick, so DST shifts are handled
@@ -78,6 +80,13 @@ ACTIVE_SYMBOLS: Dict[str, SymbolConfig] = {
 
 # Deriv synthetic prefixes are monitored 24/7 (no forex session filters).
 SYNTHETIC_PREFIXES = ("VOL", "JUMP", "BOOM", "CRASH")
+
+# Historical bar data. Point PHANTOM_DATA_DIR at a directory of
+# "<SYMBOL>_<TIMEFRAME>.csv" files (columns: time,open,high,low,close[,volume]).
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(getenv("PHANTOM_DATA_DIR", str(REPO_ROOT / "data")))
+RESULTS_DIR = Path(getenv("PHANTOM_RESULTS_DIR", str(REPO_ROOT / "backtest_results")))
+TIMEFRAME_MINUTES: Dict[str, int] = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60}
 
 # Telegram Configuration (never commit real secrets; set them in .env or the environment)
 TELEGRAM_BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")

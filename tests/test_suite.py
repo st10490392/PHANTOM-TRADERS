@@ -4,13 +4,18 @@ Covers Killzones, Risk Math, Correlation Caps, and Formatting
 """
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, List
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
+from core.backtest import BacktestRunner
+from core.data_feed import available_symbols, csv_path, load_candles
 from core.risk_manager import RiskManager
 from strategies.base import Direction, Signal
+from strategies.sessions import active_session
 from strategies.smc_ict_killzone import SMCICTKillzone
 from strategies.z_score_anchor import ZScoreAnchor
 from telegram import dispatcher as dispatcher_module
@@ -61,13 +66,20 @@ class TestPhantomInfrastructure(unittest.TestCase):
         lots = self.risk_mgr.calculate_lot_size(signal)
         # $15 risk / (10 pips * $10/pip standard) = 0.15 lots
         self.assertEqual(lots, 0.15)
+        # Realized risk at the traded lot must never exceed the risk budget
+        # (epsilon absorbs float noise: 0.15 * 100000 * 0.001 == 15.0000000000017).
+        realized = lots * ACTIVE_SYMBOLS["EURUSD"].contract_size * (signal.entry_price - signal.stop_loss)
+        self.assertLessEqual(realized, self.risk_mgr.risk_amount + 1e-6)
 
     def test_lot_size_gold_index_and_max_lot_cap(self):
         """Metals/indices size correctly and synthetics respect broker max_lot"""
         gold = Signal(symbol="XAUUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
                       entry_price=2650.00, stop_loss=2640.00, take_profit=2670.00, risk_reward=2.0)
-        # $1000 risk per lot => 0.015 raw, snapped to the 0.01 broker lot step
-        self.assertIn(self.risk_mgr.calculate_lot_size(gold), [0.01, 0.02])
+        # $1000 risk per lot => raw 0.015, floored to the 0.01 broker step (never rounded up)
+        self.assertEqual(self.risk_mgr.calculate_lot_size(gold), 0.01)
+        # Realized risk at the floored lot must stay inside the $15 budget
+        self.assertLessEqual(0.01 * ACTIVE_SYMBOLS["XAUUSD"].contract_size * 10.0,
+                             self.risk_mgr.risk_amount)
 
         index = Signal(symbol="US30", direction=Direction.SELL, strategy_tag="SMC_FIB",
                        entry_price=23000.0, stop_loss=23100.0, take_profit=22800.0, risk_reward=2.0)
@@ -75,8 +87,18 @@ class TestPhantomInfrastructure(unittest.TestCase):
 
         synthetic = Signal(symbol="VOL75", direction=Direction.BUY, strategy_tag="Z_SCORE",
                            entry_price=10.0, stop_loss=8.0, take_profit=14.0, risk_reward=2.0)
-        # $2/lot risk => 7.5 raw lots, capped at max_lot 1.0
+        # $2/lot risk => 7.5 raw lots, capped at max_lot 1.0 (cap only ever reduces risk)
         self.assertEqual(self.risk_mgr.calculate_lot_size(synthetic), 1.0)
+
+    def test_wide_stop_is_rejected_instead_of_over_leveraged(self):
+        """A stop that needs less than broker min_lot must be skipped, not upsized"""
+        wide = Signal(symbol="USDJPY", direction=Direction.SELL, strategy_tag="SMC_FIB",
+                      entry_price=157.000, stop_loss=157.500, take_profit=156.000, risk_reward=2.0)
+        # $5000 risk per lot -> raw 0.003 lots, below the 0.01 broker step
+        self.assertEqual(self.risk_mgr.calculate_lot_size(wide), 0.0)
+        verdict = self.risk_mgr.validate_signal(wide, [])
+        self.assertFalse(verdict["approved"])
+        self.assertIn("exceeds the risk budget", verdict["reason"])
 
     def test_correlation_cap_enforcement(self):
         """Ensure 3rd USD position is rejected"""
@@ -220,7 +242,136 @@ class TestPhantomInfrastructure(unittest.TestCase):
         self.assertEqual(ACTIVE_SYMBOLS["XAUUSD"].asset_class, "metal")
         self.assertIn("SMC_FIB", ACTIVE_SYMBOLS["EURUSD"].authorized_strategies)
 
+    # ---------------- Seasonal (DST) shift regression ----------------
+    def test_killzone_seasonal_utc_shift(self):
+        """The same local bounds land on different UTC hours in BST/EDT seasons"""
+        london_open = PROP_CONFIG.LONDON_KILLZONE[0]   # 07:00 local
+        ny_open = PROP_CONFIG.NY_KILLZONE[0]           # 13:30 local
+
+        london_winter = datetime(2026, 1, 15, london_open[0], london_open[1],
+                                 tzinfo=PROP_CONFIG.TIMEZONE_LONDON).astimezone(UTC)
+        london_summer = datetime(2026, 7, 15, london_open[0], london_open[1],
+                                 tzinfo=PROP_CONFIG.TIMEZONE_LONDON).astimezone(UTC)
+        ny_winter = datetime(2026, 1, 15, ny_open[0], ny_open[1],
+                             tzinfo=PROP_CONFIG.TIMEZONE_NY).astimezone(UTC)
+        ny_summer = datetime(2026, 7, 15, ny_open[0], ny_open[1],
+                             tzinfo=PROP_CONFIG.TIMEZONE_NY).astimezone(UTC)
+
+        self.assertEqual(london_winter.hour, 7)   # UTC+0 season: 07:00 UTC
+        self.assertEqual(london_summer.hour, 6)   # BST season: 06:00 UTC
+        self.assertEqual(ny_winter.hour, 18)      # UTC-5 season: 18:30 UTC
+        self.assertEqual(ny_summer.hour, 17)      # EDT season: 17:30 UTC
+
+        self.assertEqual(self.smc._active_session(london_winter, "EURUSD"), "LDN")
+        self.assertEqual(self.smc._active_session(london_summer, "EURUSD"), "LDN")
+        self.assertEqual(self.smc._active_session(ny_winter, "XAUUSD"), "NY")
+        self.assertEqual(self.smc._active_session(ny_summer, "XAUUSD"), "NY")
+
+        # The mirrored UTC instant must flip with the season, not stay fixed.
+        self.assertIsNone(self.smc._active_session(datetime(2026, 1, 15, 6, 0, tzinfo=UTC), "EURUSD"))
+        self.assertEqual(self.smc._active_session(datetime(2026, 7, 15, 6, 0, tzinfo=UTC), "EURUSD"), "LDN")
+        self.assertIsNone(self.smc._active_session(datetime(2026, 7, 15, 11, 0, tzinfo=UTC), "EURUSD"))
+        self.assertIsNone(self.smc._active_session(datetime(2026, 7, 15, 16, 30, tzinfo=UTC), "XAUUSD"))
+        self.assertIsNone(self.smc._active_session(datetime(2026, 1, 15, 17, 30, tzinfo=UTC), "XAUUSD"))
+
+    def test_zoneinfo_offsets_across_dst_transitions(self):
+        """zoneinfo carries the seasonal offsets, so no biannual code edit is needed"""
+        eu_before = datetime(2026, 3, 28, 12, 0, tzinfo=UTC).astimezone(PROP_CONFIG.TIMEZONE_LONDON)
+        eu_after = datetime(2026, 3, 29, 12, 0, tzinfo=UTC).astimezone(PROP_CONFIG.TIMEZONE_LONDON)
+        us_before = datetime(2026, 3, 7, 12, 0, tzinfo=UTC).astimezone(PROP_CONFIG.TIMEZONE_NY)
+        us_after = datetime(2026, 3, 8, 12, 0, tzinfo=UTC).astimezone(PROP_CONFIG.TIMEZONE_NY)
+
+        self.assertEqual(eu_before.utcoffset(), timedelta(hours=0))
+        self.assertEqual(eu_after.utcoffset(), timedelta(hours=1))
+        self.assertEqual(us_before.utcoffset(), timedelta(hours=-5))
+        self.assertEqual(us_after.utcoffset(), timedelta(hours=-4))
+
+    def test_sessions_module_matches_engine_gate(self):
+        """Shared clock is the single source of truth for every engine"""
+        instants = [datetime(2026, 1, 15, 8, 0, tzinfo=UTC), datetime(2026, 7, 15, 6, 0, tzinfo=UTC),
+                    datetime(2026, 1, 15, 18, 30, tzinfo=UTC), datetime(2026, 1, 15, 12, 0, tzinfo=UTC)]
+        for instant in instants:
+            self.assertEqual(active_session(instant, "EURUSD"), self.smc._active_session(instant, "EURUSD"))
+
     # ---------------- Z-Score Anchor ----------------
+    def test_z_score_edge_trigger_and_cooldown(self):
+        """A single stretch must not re-alert on every following bar"""
+        anchor = ZScoreAnchor()
+        anchor.COOLDOWN_BARS = 2  # shrink the 8h M5 cooldown for a fast deterministic test
+        start = datetime(2026, 1, 15, 4, 0, tzinfo=UTC)  # winter -> bars land inside LDN
+        closes = [1.0 + 0.001 * (i % 5) for i in range(99)] + [1.150] * 6 + [1.003] * 11 + [1.200]
+        candles = candles_from(closes, start, spread=0.001)
+        london_morning = datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+
+        first = anchor.analyze(candles[:100], "EURUSD", london_morning)
+        self.assertIsNotNone(first)
+
+        # Stretch persists: edge-trigger must suppress the follow-up bars.
+        for index in range(101, 105):
+            self.assertIsNone(anchor.analyze(candles[:index + 1], "EURUSD", london_morning),
+                              msg=f"re-alerted at bar {index} without mean reversion")
+
+        # Mean reversion (|z| back inside the entry band) re-arms the trigger.
+        for index in range(105, 116):
+            self.assertIsNone(anchor.analyze(candles[:index + 1], "EURUSD", london_morning))
+
+        second = anchor.analyze(candles[:len(candles)], "EURUSD", london_morning)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(first.direction, Direction.SELL)
+        self.assertEqual(second.direction, Direction.SELL)
+        self.assertGreater(second.metadata["z_score"], ZScoreAnchor.ENTRY_Z)
+        self.assertEqual(ZScoreAnchor.COOLDOWN_BARS, 96)
+
+        anchor.reset("EURUSD")
+        self.assertIsNotNone(anchor.analyze(candles[:100], "EURUSD", london_morning))
+
+    def test_z_score_forex_alerts_are_killzone_scoped(self):
+        """Forex bonus alerts need London/NY; Deriv synthetics stay 24/7"""
+        anchor = ZScoreAnchor()
+        closes = [1.0 + 0.001 * (i % 5) for i in range(99)] + [1.150]
+        candles = candles_from(closes, datetime(2026, 1, 15, 4, 0, tzinfo=UTC), spread=0.001)
+
+        outside = datetime(2026, 1, 15, 2, 30, tzinfo=UTC)  # 02:30 London -> outside both zones
+        self.assertIsNone(anchor.analyze(candles, "EURUSD", outside))
+        anchor.reset()   # fresh edge-trigger state per independent gate probe
+        self.assertIsNotNone(anchor.analyze(candles, "EURUSD", datetime(2026, 1, 15, 8, 0, tzinfo=UTC)))
+        anchor.reset()
+        self.assertIsNotNone(anchor.analyze(candles, "EURUSD", datetime(2026, 1, 15, 18, 30, tzinfo=UTC)))
+
+        synthetic = [100.0 - 0.15 * (i % 5) for i in range(99)] + [84.0]
+        synth_candles = candles_from(synthetic, datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+                                     step=timedelta(minutes=1), spread=0.4)
+        midnight = anchor.analyze(synth_candles, "VOL75", datetime(2026, 1, 15, 0, 30, tzinfo=UTC))
+        self.assertIsNotNone(midnight)
+        assert midnight is not None
+        self.assertEqual(midnight.metadata["session"], "GLOBAL")
+        self.assertEqual(midnight.metadata["engine"], "DERIV_SYNTHETICS")
+
+    def test_daily_setup_budget_caps(self):
+        """1-2 setups/day per asset and 3/day portfolio-wide, reset at UTC midnight"""
+        day = "2026-01-15"
+        signal = Signal(symbol="EURUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
+                        entry_price=1.10000, stop_loss=1.09900, take_profit=1.10200, risk_reward=2.0)
+        self.assertTrue(self.risk_mgr.validate_signal(signal, [], day_key=day)["approved"])
+        self.assertTrue(self.risk_mgr.validate_signal(signal, [], day_key=day)["approved"])
+
+        third = self.risk_mgr.validate_signal(signal, [], day_key=day)
+        self.assertFalse(third["approved"])
+        self.assertIn("Daily setup cap reached", third["reason"])
+
+        gold = Signal(symbol="XAUUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
+                      entry_price=2650.00, stop_loss=2640.00, take_profit=2670.00, risk_reward=2.0)
+        self.assertTrue(self.risk_mgr.validate_signal(gold, [], day_key=day)["approved"])
+        fourth = self.risk_mgr.validate_signal(gold, [], day_key=day)
+        self.assertFalse(fourth["approved"])
+        self.assertIn("Daily setup budget exhausted", fourth["reason"])
+
+        self.assertEqual(self.risk_mgr.setups_today(day), PROP_CONFIG.MAX_DAILY_SETUPS_TOTAL)
+        self.assertEqual(self.risk_mgr.setups_today(day, "EURUSD"), PROP_CONFIG.MAX_DAILY_SETUPS_PER_SYMBOL)
+        self.assertTrue(self.risk_mgr.validate_signal(signal, [], day_key="2026-01-16")["approved"])
+
+    # ---------------- Telegram Dispatcher ----------------
     def test_z_score_bearish_stretch(self):
         closes = [1.0 + 0.001 * (i % 5) for i in range(99)] + [1.150]
         candles = candles_from(closes, datetime(2025, 1, 15, 4, 0, tzinfo=UTC), spread=0.001)
@@ -304,6 +455,70 @@ class TestPhantomInfrastructure(unittest.TestCase):
              patch("requests.post", side_effect=AssertionError("network call attempted")):
             self.assertFalse(TelegramDispatcher.send_alert(signal, {"lot_size": 0.15, "risk_usd": 15.0}))
             self.assertFalse(TelegramDispatcher.send_lifecycle("ENTRY", signal))
+
+
+class TestPhantomDataPipeline(unittest.TestCase):
+    """Historical CSV ingestion and offline portfolio replay."""
+
+    def _candles(self) -> List[Dict]:
+        """Asia pool (00:00-07:00 London) swept at 07:45, MSS bar at 08:00 inside the LDN killzone."""
+        start = datetime(2026, 1, 15, 2, 0, tzinfo=UTC)  # winter: London == UTC
+        base = candles_from([1.1000 + 0.0004 * (i % 4) for i in range(20)], start, spread=0.0010)
+        sweep = {"time": datetime(2026, 1, 15, 7, 45, tzinfo=UTC), "open": 1.1010, "high": 1.1012,
+                 "low": 1.0950, "close": 1.1000, "volume": 90}
+        displacement = {"time": datetime(2026, 1, 15, 8, 0, tzinfo=UTC), "open": 1.1000, "high": 1.1045,
+                        "low": 1.0997, "close": 1.1040, "volume": 120}
+        return base + [sweep, displacement]
+
+    def _write_csv(self, root: Path, symbol: str, candles: List[Dict]) -> Path:
+        path = root / f"{symbol}_M5.csv"
+        lines = ["time,open,high,low,close,volume"]
+        for candle in candles:
+            lines.append(f"{int(candle['time'].timestamp())},{candle['open']},{candle['high']},"
+                         f"{candle['low']},{candle['close']},{candle['volume']}")
+        path.write_text("\n".join(lines))
+        return path
+
+    def test_csv_ingestion(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candles = self._candles()
+            self._write_csv(root, "EURUSD", candles)
+            (root / "GBPUSD_M5.csv").write_text("time,open,high,low,close\nnot,a,number,row\n")
+
+            self.assertEqual(available_symbols(root), ["EURUSD", "GBPUSD"])  # lists files on disk
+            self.assertEqual(load_candles("GBPUSD", "M5", root), [])         # malformed rows skipped
+            self.assertEqual(csv_path("EURUSD", "M5", root).name, "EURUSD_M5.csv")
+
+            loaded = load_candles("EURUSD", "M5", root)
+            self.assertEqual(len(loaded), len(candles))
+            self.assertEqual(loaded[0]["time"], candles[0]["time"])
+            self.assertEqual(loaded[0]["time"].tzinfo, UTC)          # DST clock needs tz-aware bars
+            self.assertEqual(load_candles("NOPE", "M5", root), [])
+
+            trimmed = load_candles("EURUSD", "M5", root, start=candles[10]["time"])
+            self.assertEqual(len(trimmed), len(candles) - 10)
+
+    def test_replay_runs_the_live_gates(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_csv(root, "EURUSD", self._candles())
+            records = BacktestRunner(root, "M5", source="tmp").run(["EURUSD"])
+
+            summary = next(record for record in records if record.get("summary"))
+            self.assertEqual(summary["source"], "tmp")
+            self.assertGreater(summary["trades"], 0)
+            self.assertLessEqual(summary["max_daily_dd_pct"], PROP_CONFIG.MAX_DAILY_DD_PERCENT * 100)
+            self.assertEqual(summary["dd_breach_days"], [])
+
+            record = next(r for r in records if not r.get("summary"))
+            self.assertEqual(record["strategy"], "SMC_FIB")
+            self.assertEqual(record["signals"], 1)      # one sweep, one alert
+            self.assertEqual(record["trades"], 1)
+            self.assertLessEqual(record["avg_lot"], ACTIVE_SYMBOLS["EURUSD"].max_lot)
+            self.assertGreater(record["avg_lot"], 0.0)
+            # R multiple must equal PnL / the $15 risk budget, i.e. sizing really is $15/trade.
+            self.assertAlmostEqual(record["net_r"], record["net_usd"] / PROP_CONFIG.BASE_RISK_AMOUNT, places=2)
 
 
 if __name__ == "__main__":
