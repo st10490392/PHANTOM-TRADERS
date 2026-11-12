@@ -63,4 +63,12 @@ Candles arrive as `[{'time': tz-aware datetime, 'open': float, 'high': float, 'l
 
 ## Secrets
 
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read from the environment (placeholders keep `send_alert()` a no-op instead of a crash). Never commit real credentials; `config/settings.py` reads `os.getenv`.
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read from the environment or an untracked
+`.env` beside `config/settings.py` (loaded via `python-dotenv`; real env vars win). Placeholders
+keep `send_alert()` a no-op instead of a crash. `config/settings.py` reads `os.getenv` and
+`.gitignore` excludes `.env` — never commit a bot token.
+
+```bash
+cp .env.example .env   # then fill in BotFather token + channel id (channels use negative ids)
+```
+

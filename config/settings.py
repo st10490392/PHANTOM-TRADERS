@@ -2,10 +2,20 @@
 PHANTOM-TRADERS Global Configuration
 Optimized for $5k Instant Funding Prop Firm Accounts
 """
+from pathlib import Path
 from os import getenv
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+
+# Local .env (never committed) supplements the process environment.
+# Real environment variables take precedence over this file.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:  # repo stays runnable without python-dotenv installed
+    pass
 
 SessionBounds = Tuple[Tuple[int, int], Tuple[int, int]]
 
@@ -69,7 +79,7 @@ ACTIVE_SYMBOLS: Dict[str, SymbolConfig] = {
 # Deriv synthetic prefixes are monitored 24/7 (no forex session filters).
 SYNTHETIC_PREFIXES = ("VOL", "JUMP", "BOOM", "CRASH")
 
-# Telegram Configuration (never commit real secrets; supply via environment)
+# Telegram Configuration (never commit real secrets; set them in .env or the environment)
 TELEGRAM_BOT_TOKEN = getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = getenv("TELEGRAM_CHAT_ID", "YOUR_PHANTOM_ALERTS_CHANNEL_ID")
 

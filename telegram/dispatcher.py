@@ -59,7 +59,7 @@ _Metadata:_ {signal.metadata}
 
     @classmethod
     def _post(cls, text: str) -> bool:
-        if "YOUR_TELEGRAM" in cls.BASE_URL or TELEGRAM_CHAT_ID.startswith("YOUR_"):
+        if TELEGRAM_BOT_TOKEN.startswith("YOUR_") or TELEGRAM_CHAT_ID.startswith("YOUR_"):
             print("[TELEGRAM DISPATCH SKIPPED] bot token / chat id not configured")
             return False
 

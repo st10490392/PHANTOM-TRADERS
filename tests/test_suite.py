@@ -5,6 +5,7 @@ Covers Killzones, Risk Math, Correlation Caps, and Formatting
 import unittest
 from datetime import datetime, timedelta
 from typing import Dict, List
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
@@ -12,6 +13,7 @@ from core.risk_manager import RiskManager
 from strategies.base import Direction, Signal
 from strategies.smc_ict_killzone import SMCICTKillzone
 from strategies.z_score_anchor import ZScoreAnchor
+from telegram import dispatcher as dispatcher_module
 from telegram.dispatcher import TelegramDispatcher
 
 UTC = ZoneInfo("UTC")
@@ -294,10 +296,14 @@ class TestPhantomInfrastructure(unittest.TestCase):
         self.assertIn("Judas sweep invalidated", closed)
 
     def test_dispatcher_fails_safe_without_credentials(self):
+        """Unconfigured credentials must no-op, never hit the network"""
         signal = Signal(symbol="EURUSD", direction=Direction.BUY, strategy_tag="SMC_FIB",
                         entry_price=1.10, stop_loss=1.099, take_profit=1.102, risk_reward=2.0)
-        self.assertFalse(TelegramDispatcher.send_alert(signal, {"lot_size": 0.15, "risk_usd": 15.0}))
-        self.assertFalse(TelegramDispatcher.send_lifecycle("ENTRY", signal))
+        with patch.object(dispatcher_module, "TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN"), \
+             patch.object(dispatcher_module, "TELEGRAM_CHAT_ID", "YOUR_PHANTOM_ALERTS_CHANNEL_ID"), \
+             patch("requests.post", side_effect=AssertionError("network call attempted")):
+            self.assertFalse(TelegramDispatcher.send_alert(signal, {"lot_size": 0.15, "risk_usd": 15.0}))
+            self.assertFalse(TelegramDispatcher.send_lifecycle("ENTRY", signal))
 
 
 if __name__ == "__main__":
