@@ -14,10 +14,11 @@ from zoneinfo import ZoneInfo
 
 from .backtest import SCAN_WINDOW, Position
 from .data_feed import CsvBarFeed
-from .mt5_bridge import ExecutionBridge, build_execution
+from .mt5_bridge import ExecutionBridge, build_execution, reconcile_positions
 from .mt5_feed import build_feed
+from .resilience import Backoff, StaleFeedGuard, halted
 from .risk_manager import RiskManager
-from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG
+from config.settings import ACTIVE_SYMBOLS, MT5_MAGIC, PROP_CONFIG
 from strategies import STRATEGY_REGISTRY
 from telegram.dispatcher import TelegramDispatcher
 
@@ -45,6 +46,17 @@ class LiveEngine:
         self.execution = execution if execution is not None else build_execution(bridge, self.dispatch)
         self._day: Optional[str] = None
         self._day_start = equity
+        self._stale_guard = StaleFeedGuard()
+        self._halted_reason: Optional[str] = None
+        if self.execution is not None:
+            # Crash/restart recovery: don't let a restarted process re-enter a
+            # symbol the terminal is already holding a position in from before
+            # the crash. See core.mt5_bridge.reconcile_positions for caveats.
+            recovered = reconcile_positions(self.feed, magic=MT5_MAGIC)
+            if recovered:
+                self.positions.update(recovered)
+                print(f"[ENGINE] reconciled {len(recovered)} pre-existing position(s) on startup: "
+                      f"{sorted(recovered)}")
 
     # ---------------- Daily accounting ----------------
     def _roll_day(self, stamp: datetime) -> str:
@@ -139,29 +151,67 @@ class LiveEngine:
         day_key = self._roll_day(stamp)
         self._ingest_fills()
 
+        halt_reason = halted()
+        if halt_reason != self._halted_reason:
+            print(f"[ENGINE] {'HALTED: ' + halt_reason if halt_reason else 'resuming (halt cleared)'}")
+            self._halted_reason = halt_reason
+
+        any_candles = False
+        newest_bar: Optional[datetime] = None
         for symbol in universe:
             candles = self.feed.candles(symbol, self.timeframe)
             if not candles:
                 continue
+            any_candles = True
+            newest_bar = candles[-1]["time"] if newest_bar is None else max(newest_bar, candles[-1]["time"])
+            # Existing positions are always managed/exited, even while halted -
+            # the halt switch stops new risk, it never abandons open trades.
             self._manage(symbol, candles[-1])
+            if halt_reason:
+                self.rejections["halted"] += 1
+                continue
             # Gate on the live tick clock, not the bar's open time: an M5 bar that
             # opened at 09:55 closes at 10:00 and must not fire outside the killzone.
             self._scan(symbol, candles, stamp, day_key)
 
+        if self._stale_guard.observe(any_candles, newest_bar) and hasattr(self.feed, "reconnect"):
+            print("[ENGINE] feed looks stale, attempting reconnect")
+            if self.feed.reconnect():
+                self._stale_guard.reset()
+
         return {"equity": round(self.equity, 2), "alerts": self.alerts,
                 "open_positions": len(self.positions), "day": day_key,
                 "max_daily_dd_pct": round(100 * self.max_daily_dd_pct, 2),
-                "rejections": dict(self.rejections)}
+                "rejections": dict(self.rejections), "halted": halt_reason}
 
     def run(self, interval: int = 60, symbols: Optional[List[str]] = None,
             max_iterations: Optional[int] = None) -> Dict:
+        """
+        Runs forever (or for max_iterations). A tick that raises is caught,
+        logged, and backed off instead of killing the process - this is a
+        last line of defense against a logic bug in one tick, not a
+        substitute for process supervision: if the process itself dies
+        (OOM, host reboot, `kill -9`), something outside it (systemd,
+        NSSM/Task Scheduler, a watchdog script - see deploy/) must restart it.
+        """
         iterations = 0
         summary: Dict = {}
+        backoff = Backoff()
         while max_iterations is None or iterations < max_iterations:
-            summary = self.tick(symbols=symbols)
+            try:
+                summary = self.tick(symbols=symbols)
+            except Exception as exc:   # noqa: BLE001 - keep the loop alive, always
+                iterations += 1
+                delay = backoff.sleep_after_failure()
+                print(f"[ENGINE] tick {iterations} raised {exc!r}; backing off {delay:.0f}s")
+                if max_iterations is not None and iterations >= max_iterations:
+                    break
+                continue
+            backoff.ok()
             iterations += 1
             print(f"[ENGINE] tick {iterations} {summary['day']} equity={summary['equity']} "
-                  f"open={summary['open_positions']} alerts={summary['alerts']}")
+                  f"open={summary['open_positions']} alerts={summary['alerts']}"
+                  f"{' HALTED' if summary.get('halted') else ''}")
             if max_iterations is not None and iterations >= max_iterations:
                 break
             time.sleep(interval)

@@ -1,0 +1,27 @@
+[Unit]
+Description=PHANTOM-TRADERS 24/7 Deriv synthetics scanner
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=phantom
+WorkingDirectory=/opt/phantom-traders
+EnvironmentFile=/opt/phantom-traders/.env
+ExecStart=/opt/phantom-traders/venv/bin/python -m core.engine_synthetics --feed mt5 --timeframe M1 --bridge --interval 30
+
+Restart=always
+RestartSec=5
+StartLimitBurst=20
+StartLimitIntervalSec=600
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/phantom-traders
+
+[Install]
+WantedBy=multi-user.target

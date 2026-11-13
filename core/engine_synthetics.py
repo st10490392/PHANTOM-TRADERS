@@ -14,10 +14,11 @@ from zoneinfo import ZoneInfo
 
 from .backtest import Position
 from .data_feed import CsvBarFeed, DEFAULT_WINDOW
-from .mt5_bridge import ExecutionBridge, build_execution
+from .mt5_bridge import ExecutionBridge, build_execution, reconcile_positions
 from .mt5_feed import build_feed
+from .resilience import Backoff, StaleFeedGuard, halted
 from .risk_manager import RiskManager
-from config.settings import ACTIVE_SYMBOLS, PROP_CONFIG, SYNTHETIC_UNIVERSE
+from config.settings import ACTIVE_SYMBOLS, MT5_MAGIC, PROP_CONFIG, SYNTHETIC_UNIVERSE
 from strategies import STRATEGY_REGISTRY, SYNTHETIC_STRATEGIES
 from telegram.dispatcher import TelegramDispatcher
 
@@ -44,6 +45,14 @@ class SyntheticScanner:
         self.execution = execution if execution is not None else build_execution(bridge, self.dispatch)
         self._day: Optional[str] = None
         self._day_start = equity
+        self._stale_guard = StaleFeedGuard()
+        self._halted_reason: Optional[str] = None
+        if self.execution is not None:
+            recovered = reconcile_positions(self.feed, magic=MT5_MAGIC)
+            if recovered:
+                self.positions.update(recovered)
+                print(f"[SYNTHETICS] reconciled {len(recovered)} pre-existing position(s) on startup: "
+                      f"{sorted(recovered)}")
 
     def _roll_day(self, stamp: datetime) -> str:
         day = stamp.date().isoformat()
@@ -93,6 +102,13 @@ class SyntheticScanner:
         day_key = self._roll_day(stamp)
         self._ingest_fills()
 
+        halt_reason = halted()
+        if halt_reason != self._halted_reason:
+            print(f"[SYNTHETICS] {'HALTED: ' + halt_reason if halt_reason else 'resuming (halt cleared)'}")
+            self._halted_reason = halt_reason
+
+        any_candles = False
+        newest_bar: Optional[datetime] = None
         for symbol in universe:
             cfg = ACTIVE_SYMBOLS.get(symbol)
             if cfg is None or cfg.asset_class != "synthetic":
@@ -100,7 +116,12 @@ class SyntheticScanner:
             candles = self.feed.candles(symbol, self.timeframe)
             if not candles:
                 continue
+            any_candles = True
+            newest_bar = candles[-1]["time"] if newest_bar is None else max(newest_bar, candles[-1]["time"])
             self._manage(symbol, candles[-1])
+            if halt_reason:
+                self.rejections["halted"] += 1
+                continue
             if self._dd_breached():
                 self.rejections["daily drawdown breach"] += 1
                 continue
@@ -131,10 +152,15 @@ class SyntheticScanner:
                 if self.execution is not None:
                     self.execution.submit(signal, verdict)  # atomic order file for the EA
 
+        if self._stale_guard.observe(any_candles, newest_bar) and hasattr(self.feed, "reconnect"):
+            print("[SYNTHETICS] feed looks stale, attempting reconnect")
+            if self.feed.reconnect():
+                self._stale_guard.reset()
+
         return {"equity": round(self.equity, 2), "alerts": self.alerts,
                 "open_positions": len(self.positions), "day": day_key,
                 "max_daily_dd_pct": round(100 * self.max_daily_dd_pct, 2),
-                "rejections": dict(self.rejections)}
+                "rejections": dict(self.rejections), "halted": halt_reason}
 
     def _ingest_fills(self) -> None:
         """Apply terminal receipts: equity from closes, cards from lifecycle events."""
@@ -148,13 +174,32 @@ class SyntheticScanner:
 
     def run(self, interval: int = 30, symbols: Optional[List[str]] = None,
             max_iterations: Optional[int] = None) -> Dict:
+        """
+        Runs forever (or for max_iterations). A scan that raises is caught,
+        logged, and backed off instead of killing the process - this is a
+        last line of defense against a logic bug in one scan, not a
+        substitute for process supervision: if the process itself dies
+        (OOM, host reboot, `kill -9`), something outside it (systemd,
+        NSSM/Task Scheduler, a watchdog script - see deploy/) must restart it.
+        """
         iterations = 0
         summary: Dict = {}
+        backoff = Backoff()
         while max_iterations is None or iterations < max_iterations:
-            summary = self.scan_once(symbols=symbols)
+            try:
+                summary = self.scan_once(symbols=symbols)
+            except Exception as exc:   # noqa: BLE001 - keep the loop alive, always
+                iterations += 1
+                delay = backoff.sleep_after_failure()
+                print(f"[SYNTHETICS] scan {iterations} raised {exc!r}; backing off {delay:.0f}s")
+                if max_iterations is not None and iterations >= max_iterations:
+                    break
+                continue
+            backoff.ok()
             iterations += 1
             print(f"[SYNTHETICS] scan {iterations} {summary['day']} open={summary['open_positions']} "
-                  f"alerts={summary['alerts']} equity={summary['equity']}")
+                  f"alerts={summary['alerts']} equity={summary['equity']}"
+                  f"{' HALTED' if summary.get('halted') else ''}")
             if max_iterations is not None and iterations >= max_iterations:
                 break
             time.sleep(interval)

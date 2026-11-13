@@ -1,0 +1,35 @@
+[Unit]
+Description=PHANTOM-TRADERS live forex/gold/indices engine (session killzones)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=phantom
+WorkingDirectory=/opt/phantom-traders
+EnvironmentFile=/opt/phantom-traders/.env
+# --feed mt5 --bridge: live terminal bars + real order execution via the EA file bridge.
+# Drop --bridge for a paper/dry-run deployment (alerts only, no order files written).
+ExecStart=/opt/phantom-traders/venv/bin/python -m core.engine --feed mt5 --bridge --interval 60
+
+Restart=always
+RestartSec=5
+# A process that keeps crashing instantly (bad config, missing venv) shouldn't
+# spin forever burning CPU/log space; systemd backs off once the loop's own
+# in-process backoff (core/resilience.py) isn't enough to save it.
+StartLimitBurst=20
+StartLimitIntervalSec=600
+
+# Kill switch without touching the unit: `sudo systemctl stop phantom-engine`,
+# or set PHANTOM_HALT=1 / touch the halt file to pause new entries while
+# letting the process keep managing open positions and reporting fills.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/phantom-traders
+
+[Install]
+WantedBy=multi-user.target

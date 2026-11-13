@@ -148,6 +148,20 @@ Candles arrive as `[{'time': tz-aware datetime, 'open': float, 'high': float, 'l
 * **Python REST broker API** — pass candles from your data feed, call `analyze()`, then `validate_signal()` before order placement.
 * **Deriv** — synthetics bypass session filters (`asset_class == "synthetic"`), sizing uses `contract_size`/`point_value`, and the terminal exposes them as `Volatility/Jump/Step/Boom/Crash Index` symbols.
 
+## Unattended operation
+
+`core/resilience.py` adds the primitives a 24/7 VM deployment needs on top of
+the single-account engines above: an operator halt switch (env var or touch
+file, checked every tick, blocks new entries without abandoning open ones),
+exponential backoff around the run loop so a bad tick doesn't kill the
+process, MT5 feed reconnect when candles stop arriving, startup reconciliation
+of positions the terminal already holds (crash-restart safety), and a sweep
+that quarantines order files the EA never picked up. None of this replaces
+process supervision - see `deploy/README.md` for systemd units (Linux) and
+Task Scheduler/NSSM setup (Windows, where the MT5 terminal + EA actually run),
+plus what's still missing (multi-tenant isolation, alerting, broker-side
+watchdogs) before running this against more than your own account.
+
 ## Secrets
 
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read from the environment or an untracked

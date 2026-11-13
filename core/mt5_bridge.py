@@ -9,6 +9,7 @@ terminal's MQL5/Files folder, so PHANTOM_MT5_FILES_DIR must point at that folder
 """
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,14 +35,55 @@ class Fill:
     note: str = ""
 
 
+STALE_ORDER_MAX_AGE_S = 15 * 60   # an order the EA hasn't picked up in 15 min is dead, not late
+
+
 class MT5FileBridge:
-    def __init__(self, root: Path = MT5_FILES_DIR, magic: int = MT5_MAGIC):
+    def __init__(self, root: Path = MT5_FILES_DIR, magic: int = MT5_MAGIC,
+                 sweep_stale: bool = True, stale_max_age_s: int = STALE_ORDER_MAX_AGE_S):
         self.root = Path(root)
         self.orders_dir = self.root / "orders"
         self.fills_dir = self.root / "fills"
+        self.quarantine_dir = self.root / "quarantine"
         self.magic = magic
         self.orders_dir.mkdir(parents=True, exist_ok=True)
         self.fills_dir.mkdir(parents=True, exist_ok=True)
+        if sweep_stale:
+            self.sweep_stale_orders(stale_max_age_s)
+
+    def sweep_stale_orders(self, max_age_s: int = STALE_ORDER_MAX_AGE_S) -> List[str]:
+        """
+        Crash-restart idempotency: a restarted engine starts with an empty
+        in-memory position map, so it has no way to know whether an order
+        file left over from before the crash was ever read by the EA. Rather
+        than let a stale file sit there (silently picked up late, or silently
+        colliding with a fresh signal_id-named file, which can't happen since
+        ids are uuids, but *can* just be dead weight the EA keeps re-scanning)
+        every order older than max_age_s is moved into quarantine/ on startup
+        and logged, so the operator can see what was abandoned. Does not
+        touch files written since this process started.
+        """
+        moved: List[str] = []
+        if not self.orders_dir.exists():
+            return moved
+        now = time.time()
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        for path in sorted(self.orders_dir.glob("*.json")):
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < max_age_s:
+                continue
+            dest = self.quarantine_dir / f"{path.stem}.stale-{int(now)}.json"
+            try:
+                os.replace(path, dest)
+            except OSError as exc:
+                print(f"[BRIDGE] could not quarantine stale order {path.name}: {exc}")
+                continue
+            moved.append(path.name)
+            print(f"[BRIDGE] quarantined stale order {path.name} (age={int(age)}s) -> {dest.name}")
+        return moved
 
     # ---------------- Outbound orders ----------------
     @staticmethod
@@ -177,3 +219,39 @@ class ExecutionBridge:
 def build_execution(enabled: bool, dispatcher, root: Optional[Path] = None) -> Optional[ExecutionBridge]:
     bridge = build_bridge(enabled, root)
     return ExecutionBridge(bridge, dispatcher) if bridge else None
+
+
+def reconcile_positions(feed, magic: int = MT5_MAGIC) -> Dict[str, "Position"]:
+    """
+    Crash-restart recovery: ask the terminal what's actually open under our
+    magic number and rebuild enough of the in-memory position map to block
+    re-entering those symbols. This is a safety placeholder, not a full
+    recovery of lifecycle state - signal=None means these positions won't
+    produce ENTRY/BREAK_EVEN cards, only the eventual TP/SL/close card (fill
+    lookup falls back to the broker symbol tag, see ExecutionBridge.ingest),
+    and PnL on that close is correct since it comes from the terminal's own
+    deal.profit(), not from anything reconstructed here. Returns {} (not an
+    error) when the feed can't report positions - callers should not treat
+    that as "nothing is open."
+    """
+    from .backtest import Position   # local import: backtest imports engines' shared base only
+
+    if not hasattr(feed, "open_positions"):
+        return {}
+    rebuilt: Dict[str, Position] = {}
+    for pos in feed.open_positions(magic=magic):
+        tag = internal_symbol(pos["symbol"])
+        if tag in rebuilt:
+            continue   # same internal tag held twice shouldn't happen; keep the first
+        direction = "SELL" if pos.get("type") == 1 else "BUY"
+        rebuilt[tag] = Position(
+            symbol=tag, strategy="RECONCILED", direction=direction,
+            entry=float(pos.get("price_open") or 0.0),
+            stop_loss=float(pos.get("sl") or 0.0),
+            take_profit=float(pos.get("tp") or 0.0),
+            lots=float(pos.get("volume") or 0.0), risk_usd=0.0,
+            opened_at=datetime.now(UTC), signal=None,
+        )
+        print(f"[BRIDGE] reconciled pre-existing broker position: {tag} "
+              f"{direction} {pos.get('volume')} lots (ticket {pos.get('ticket')})")
+    return rebuilt

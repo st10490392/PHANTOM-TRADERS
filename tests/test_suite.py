@@ -3,6 +3,7 @@ PHANTOM-TRADERS Unit Test Suite
 Covers Killzones, Risk Math, Correlation Caps, and Formatting
 """
 import json
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -18,8 +19,9 @@ from core.backtest import BacktestRunner
 from core.data_feed import CsvBarFeed, available_symbols, csv_path, load_candles
 from core.engine import LiveEngine
 from core.engine_synthetics import SyntheticScanner
-from core.mt5_bridge import ExecutionBridge, Fill, MT5FileBridge, build_execution
+from core.mt5_bridge import ExecutionBridge, Fill, MT5FileBridge, build_execution, reconcile_positions
 from core.mt5_feed import MT5BarFeed, build_feed
+from core.resilience import Backoff, StaleFeedGuard, halted
 from core.risk_manager import RiskManager
 from strategies import sessions as sessions_module
 from strategies.base import Direction, Signal
@@ -979,6 +981,104 @@ class TestPhantomMt5Bridge(unittest.TestCase):
         self.assertEqual(payload["action"], "BUY")
         self.assertEqual(payload["strategy"], "SYNTH_MOM")
         self.assertIn(TelegramDispatcher.SYNTHETIC_TAG, self.posts[0])
+
+class TestPhantomResilience(unittest.TestCase):
+    def test_halted_is_none_by_default(self):
+        self.assertIsNone(halted())
+
+    def test_halt_env_var(self):
+        with patch.dict("os.environ", {"PHANTOM_HALT": "true"}):
+            self.assertIsNotNone(halted())
+        with patch.dict("os.environ", {"PHANTOM_HALT": "0"}):
+            self.assertIsNone(halted())
+
+    def test_halt_file_with_reason(self):
+        with TemporaryDirectory() as tmp:
+            halt_path = Path(tmp) / "phantom.halt"
+            with patch.dict("os.environ", {"PHANTOM_HALT_FILE": str(halt_path)}):
+                self.assertIsNone(halted())
+                halt_path.write_text("operator paused for maintenance", encoding="utf-8")
+                self.assertEqual(halted(), "operator paused for maintenance")
+                halt_path.unlink()
+                self.assertIsNone(halted())
+
+    def test_backoff_grows_then_resets(self):
+        backoff = Backoff(base=1.0, cap=8.0, factor=2.0)
+        with patch("core.resilience.time.sleep") as mock_sleep:
+            backoff.sleep_after_failure()
+            backoff.sleep_after_failure()
+            backoff.sleep_after_failure()
+        self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [1.0, 2.0, 4.0])
+        backoff.ok()
+        with patch("core.resilience.time.sleep") as mock_sleep:
+            backoff.sleep_after_failure()
+        self.assertEqual(mock_sleep.call_args_list[0].args[0], 1.0)
+
+    def test_stale_feed_guard_trips_after_threshold(self):
+        guard = StaleFeedGuard(max_consecutive_empty=3)
+        self.assertFalse(guard.observe(False))
+        self.assertFalse(guard.observe(False))
+        self.assertTrue(guard.observe(False))
+        guard.reset()
+        self.assertFalse(guard.observe(True))
+
+    def test_stale_feed_guard_trips_on_old_bar_age(self):
+        guard = StaleFeedGuard(max_consecutive_empty=1, max_bar_age=timedelta(minutes=5))
+        stale_bar = datetime(2025, 1, 1, tzinfo=UTC)
+        with patch("core.resilience.datetime") as mock_dt:
+            mock_dt.now.return_value = stale_bar + timedelta(hours=1)
+            self.assertTrue(guard.observe(True, stale_bar))
+
+
+class TestPhantomBridgeResilience(unittest.TestCase):
+    def test_stale_orders_are_quarantined_on_startup(self):
+        with TemporaryDirectory() as tmp:
+            bridge = MT5FileBridge(root=Path(tmp))
+            stale = bridge.orders_dir / "stale-signal.json"
+            stale.write_text('{"signal_id": "stale-signal"}', encoding="utf-8")
+            old_time = time.time() - 3600
+            import os
+            os.utime(stale, (old_time, old_time))
+
+            fresh = bridge.orders_dir / "fresh-signal.json"
+            fresh.write_text('{"signal_id": "fresh-signal"}', encoding="utf-8")
+
+            moved = bridge.sweep_stale_orders(max_age_s=900)
+            self.assertEqual(moved, ["stale-signal.json"])
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertEqual(len(list(bridge.quarantine_dir.glob("*.json"))), 1)
+
+    def test_sweep_runs_automatically_on_init(self):
+        with TemporaryDirectory() as tmp:
+            orders_dir = Path(tmp) / "orders"
+            orders_dir.mkdir(parents=True)
+            stale = orders_dir / "old.json"
+            stale.write_text("{}", encoding="utf-8")
+            old_time = time.time() - 7200
+            import os
+            os.utime(stale, (old_time, old_time))
+
+            MT5FileBridge(root=Path(tmp), stale_max_age_s=900)
+            self.assertFalse(stale.exists())
+
+    def test_reconcile_positions_rebuilds_from_terminal(self):
+        class FakeFeed:
+            def open_positions(self, magic=None):
+                return [{"ticket": 1, "symbol": "EURUSD", "volume": 0.1, "price_open": 1.1,
+                         "sl": 1.09, "tp": 1.12, "type": 0, "comment": ""}]
+
+        recovered = reconcile_positions(FakeFeed(), magic=MT5_MAGIC)
+        self.assertIn("EURUSD", recovered)
+        self.assertEqual(recovered["EURUSD"].direction, "BUY")
+        self.assertIsNone(recovered["EURUSD"].signal)
+
+    def test_reconcile_positions_empty_when_feed_lacks_support(self):
+        class BareFeed:
+            pass
+
+        self.assertEqual(reconcile_positions(BareFeed()), {})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

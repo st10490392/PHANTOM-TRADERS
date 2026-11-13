@@ -136,6 +136,72 @@ class MT5BarFeed:
         info = self._mt5.account_info()
         return float(info.equity) if info else None
 
+    def open_positions(self, magic: Optional[int] = None) -> List[Dict]:
+        """
+        Terminal positions tagged with our magic number, for crash-restart
+        reconciliation: an engine that restarted mid-session has an empty
+        in-memory position map, but the broker may still be holding trades it
+        opened before the crash. Returns [] (never raises) when the terminal
+        is unreachable, in dry-run, or under an injected transport - callers
+        must not treat an empty list as proof nothing is open in that case.
+        """
+        if self.dry_run or self.rates_fetch is not None or not self.connected:
+            return []
+        try:
+            positions = self._mt5.positions_get()
+        except Exception as exc:
+            print(f"[MT5 FEED] positions_get failed: {exc}")
+            return []
+        if not positions:
+            return []
+        out = []
+        for pos in positions:
+            if magic is not None and _field(pos, "magic") != magic:
+                continue
+            out.append({
+                "ticket": _field(pos, "ticket"),
+                "symbol": _field(pos, "symbol"),
+                "volume": _field(pos, "volume"),
+                "price_open": _field(pos, "price_open"),
+                "sl": _field(pos, "sl"),
+                "tp": _field(pos, "tp"),
+                "type": _field(pos, "type"),   # 0 = BUY, 1 = SELL
+                "comment": _field(pos, "comment", ""),
+            })
+        return out
+
+    def reconnect(self) -> bool:
+        """
+        Tear down and re-initialize the terminal connection. Used by the
+        runner's StaleFeedGuard when candles stop arriving - a terminal can
+        drop its connection (VPS network blip, broker maintenance, terminal
+        restart) without the Python process crashing, so nothing else would
+        ever notice. No-op (returns current state) in dry-run or injected-
+        transport mode, where there is no real connection to recycle.
+        """
+        if self.dry_run or self.rates_fetch is not None:
+            return self.connected
+        if self._mt5 is None:
+            self._mt5 = _mt5_module()
+            if self._mt5 is None:
+                return False
+            for tag, name in _TIMEFRAME_NAMES.items():
+                code = getattr(self._mt5, name, None)
+                if code is not None:
+                    self._codes[tag] = code
+        try:
+            if self.connected:
+                self._mt5.shutdown()
+        except Exception:
+            pass
+        self.connected = bool(self._mt5.initialize(timeout=self.timeout_ms))
+        if not self.connected:
+            print(f"[MT5 FEED] reconnect failed: {self._mt5.last_error()}")
+        else:
+            print("[MT5 FEED] reconnected")
+            self.missing = []   # symbol availability may differ after reconnect
+        return self.connected
+
     def shutdown(self) -> None:
         if self._mt5 is not None and self.connected:
             self._mt5.shutdown()
